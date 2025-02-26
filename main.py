@@ -6,6 +6,7 @@ from sklearn.cluster import DBSCAN
 import requests
 from datetime import datetime, timedelta
 from io import StringIO
+import matplotlib.colors as mcolors
 
 # Set page config
 st.set_page_config(
@@ -17,9 +18,11 @@ st.set_page_config(
 st.title("Fire Analysis Tool")
 st.markdown("---")
 
-# Initialize session state for results if not exists
+# Initialize session state for results and selected cluster
 if 'results' not in st.session_state:
     st.session_state.results = None
+if 'selected_cluster' not in st.session_state:
+    st.session_state.selected_cluster = None
 
 class FIRMSHandler:
     def __init__(self, username, password, api_key):
@@ -115,20 +118,73 @@ class FIRMSHandler:
                 st.error(f"Error fetching data: {str(e)}")
                 return None
 
-def plot_fire_detections(df, title="Fire Detections"):
-    fig, ax = plt.subplots(figsize=(10, 6))
+def plot_fire_detections(df, title="Fire Detections", selected_cluster=None):
+    """Plot fire detections using matplotlib with highlighted clusters"""
+    fig, ax = plt.subplots(figsize=(10, 8))
     
-    scatter = ax.scatter(df['longitude'], df['latitude'],
-                        c=df['cluster'],
-                        cmap='viridis',
-                        s=50,
-                        alpha=0.6)
+    # Separate the data based on the selected cluster
+    if selected_cluster is not None and selected_cluster in df['cluster'].values:
+        highlighted_points = df[df['cluster'] == selected_cluster]
+        other_points = df[df['cluster'] != selected_cluster]
+        
+        # Plot other points with lower alpha
+        scatter1 = ax.scatter(
+            other_points['longitude'], 
+            other_points['latitude'],
+            c=other_points['cluster'],
+            cmap='viridis',
+            s=50,
+            alpha=0.3
+        )
+        
+        # Plot highlighted points with higher alpha and larger size
+        scatter2 = ax.scatter(
+            highlighted_points['longitude'], 
+            highlighted_points['latitude'],
+            c=highlighted_points['cluster'],
+            cmap='viridis',
+            s=80,
+            alpha=0.9,
+            edgecolors='yellow',
+            linewidths=1
+        )
+    else:
+        # Plot all points normally
+        scatter1 = ax.scatter(
+            df['longitude'], 
+            df['latitude'],
+            c=df['cluster'],
+            cmap='viridis',
+            s=50,
+            alpha=0.6
+        )
     
-    plt.colorbar(scatter, label='Cluster ID')
-    ax.set_title(title, pad=20)
-    ax.set_xlabel('Longitude')
-    ax.set_ylabel('Latitude')
+    # Add a colorbar
+    cbar = plt.colorbar(scatter1, label='Cluster ID')
+    
+    # Set plot title and labels
+    ax.set_title(title, pad=20, fontsize=14)
+    ax.set_xlabel('Longitude', fontsize=12)
+    ax.set_ylabel('Latitude', fontsize=12)
     ax.grid(True, linestyle='--', alpha=0.7)
+    
+    # Add coordinate annotations
+    ax.text(0.01, 0.01, 'Click on a cluster in the table to highlight it on the map',
+            transform=ax.transAxes, fontsize=10, bbox=dict(facecolor='white', alpha=0.7))
+    
+    # For selected clusters, add an information box
+    if selected_cluster is not None and selected_cluster in df['cluster'].values:
+        cluster_data = df[df['cluster'] == selected_cluster]
+        info_text = (
+            f"Cluster: {selected_cluster}\n"
+            f"Points: {len(cluster_data)}\n"
+            f"Mean Lat: {cluster_data['latitude'].mean():.4f}\n"
+            f"Mean Long: {cluster_data['longitude'].mean():.4f}\n"
+            f"Mean FRP: {cluster_data['frp'].mean():.2f}"
+        )
+        ax.text(0.99, 0.99, info_text, transform=ax.transAxes, fontsize=10,
+                verticalalignment='top', horizontalalignment='right',
+                bbox=dict(facecolor='white', alpha=0.7))
     
     return fig
 
@@ -164,15 +220,46 @@ def create_cluster_summary(df):
     
     return cluster_summary.reset_index()
 
+def display_coordinate_view(df):
+    """Display a table with coordinates and details for the selected cluster"""
+    if df is None or df.empty:
+        return
+    
+    if st.session_state.selected_cluster is not None:
+        cluster_points = df[df['cluster'] == st.session_state.selected_cluster]
+        
+        if not cluster_points.empty:
+            st.subheader(f"Points in Cluster {st.session_state.selected_cluster}")
+            
+            # Create a display version of the dataframe with formatted columns
+            display_df = cluster_points[['latitude', 'longitude', 'frp', 'acq_date', 'acq_time']].copy()
+            
+            # Add a formatted coordinate column
+            display_df['Coordinates'] = display_df.apply(
+                lambda row: f"{row['latitude']:.4f}, {row['longitude']:.4f}", 
+                axis=1
+            )
+            
+            # Display the dataframe
+            st.dataframe(
+                display_df[['Coordinates', 'frp', 'acq_date', 'acq_time']],
+                column_config={
+                    "Coordinates": "Lat, Long",
+                    "frp": st.column_config.NumberColumn("FRP", format="%.2f"),
+                    "acq_date": "Date",
+                    "acq_time": "Time"
+                },
+                hide_index=True,
+                use_container_width=True
+            )
+
 def main():
     # Sidebar for inputs
     st.sidebar.header("Analysis Settings")
     
     # Country selection
     st.sidebar.subheader("Please select your country")
-    country = st.sidebar.selectbox(
-        "",  # Empty label since we have the subheader
-    {
+    country_options = {
         'Afghanistan': '60.52,29.31,75.15,38.48',
         'United States': '-125.0,24.0,-66.0,50.0',
         'Brazil': '-73.0,-33.0,-35.0,5.0',
@@ -217,6 +304,9 @@ def main():
         'Algeria': '-8.7,19.1,12.0,37.1',
         'Morocco': '-13.2,27.7,-1.0,35.9'
     }
+    country = st.sidebar.selectbox(
+        "",  # Empty label since we have the subheader
+        list(country_options.keys())
     )
     
     # Dataset selection
@@ -274,12 +364,16 @@ def main():
     if st.sidebar.button("Generate Analysis"):
         with st.spinner("Analyzing fire data..."):
             handler = FIRMSHandler(username, password, api_key)
-            st.session_state.results = handler.fetch_fire_data(
+            results = handler.fetch_fire_data(
                 country=country,
                 dataset=dataset,
                 category='wildfires',
                 use_clustering=True
             )
+            # Store results in session state
+            st.session_state.results = results
+            # Reset selected cluster
+            st.session_state.selected_cluster = None
     
     # Display results in two columns
     if st.session_state.results is not None and not st.session_state.results.empty:
@@ -287,22 +381,109 @@ def main():
         
         with col1:
             st.subheader("Fire Detection Map")
-            fig = plot_fire_detections(st.session_state.results, f"Fire Clusters - {country}")
+            
+            # Create the matplotlib visualization
+            fig = plot_fire_detections(
+                st.session_state.results, 
+                f"Fire Clusters - {country}", 
+                st.session_state.selected_cluster
+            )
+            
+            # Display the matplotlib figure
             st.pyplot(fig)
-        
+            
+            # Add a map info section
+            with st.expander("Map Information"):
+                st.write("""
+                - **Points** represent fire detections from satellite data
+                - **Colors** indicate different fire clusters identified by DBSCAN
+                - **Highlighted points** (yellow border) are from the selected cluster
+                - **Coordinate data** is displayed in the table below when a cluster is selected
+                """)
+            
+            # Display coordinate table for selected cluster
+            display_coordinate_view(st.session_state.results)
+            
         with col2:
             st.subheader("Cluster Summary")
+            
+            # Create the cluster summary table
             cluster_summary = create_cluster_summary(st.session_state.results)
-            st.dataframe(
-                cluster_summary,
-                column_config={
-                    "cluster": "Cluster ID",
-                    "Number of Points": st.column_config.NumberColumn(help="Fire detections in cluster"),
-                    "Mean FRP": st.column_config.NumberColumn(format="%.2f"),
-                    "Total FRP": st.column_config.NumberColumn(format="%.2f"),
-                },
-                hide_index=True,
-            )
+            
+            if cluster_summary is not None:
+                # Allow user to select a cluster from the table
+                st.write("Select a cluster to highlight on the map:")
+                cluster_options = [f"Cluster {c}" for c in cluster_summary['cluster'].tolist()]
+                selected_from_table = st.selectbox(
+                    "Select cluster",
+                    ["None"] + cluster_options
+                )
+                
+                if selected_from_table != "None":
+                    cluster_id = int(selected_from_table.split(' ')[1])
+                    st.session_state.selected_cluster = cluster_id
+                else:
+                    st.session_state.selected_cluster = None
+                
+                # Highlight the selected cluster in the table if one is selected
+                if st.session_state.selected_cluster is not None:
+                    highlight_func = lambda x: ['background-color: #ffff99' 
+                                              if x.name == st.session_state.selected_cluster 
+                                              else '' for i in x]
+                    styled_summary = cluster_summary.style.apply(highlight_func, axis=1)
+                    st.dataframe(
+                        styled_summary,
+                        column_config={
+                            "cluster": "Cluster ID",
+                            "Number of Points": st.column_config.NumberColumn(help="Fire detections in cluster"),
+                            "Mean FRP": st.column_config.NumberColumn(format="%.2f"),
+                            "Total FRP": st.column_config.NumberColumn(format="%.2f"),
+                        },
+                        hide_index=True,
+                        use_container_width=True
+                    )
+                else:
+                    # Display the normal table without highlighting
+                    st.dataframe(
+                        cluster_summary,
+                        column_config={
+                            "cluster": "Cluster ID",
+                            "Number of Points": st.column_config.NumberColumn(help="Fire detections in cluster"),
+                            "Mean FRP": st.column_config.NumberColumn(format="%.2f"),
+                            "Total FRP": st.column_config.NumberColumn(format="%.2f"),
+                        },
+                        hide_index=True,
+                        use_container_width=True
+                    )
+                
+                # Display detailed info for the selected cluster
+                if st.session_state.selected_cluster is not None:
+                    cluster_data = cluster_summary[cluster_summary['cluster'] == st.session_state.selected_cluster].iloc[0]
+                    
+                    st.markdown("---")
+                    st.write(f"### Cluster {st.session_state.selected_cluster} Details")
+                    
+                    # Create two columns for details
+                    detail_col1, detail_col2 = st.columns(2)
+                    
+                    with detail_col1:
+                        st.write(f"**Detection Points:** {cluster_data['Number of Points']}")
+                        st.write(f"**Mean Location:** {cluster_data['Mean Latitude']}, {cluster_data['Mean Longitude']}")
+                        st.write(f"**First Detection:** {cluster_data['First Detection']}")
+                        st.write(f"**Last Detection:** {cluster_data['Last Detection']}")
+                    
+                    with detail_col2:
+                        st.write(f"**Mean FRP:** {cluster_data['Mean FRP']:.2f}")
+                        st.write(f"**Total FRP:** {cluster_data['Total FRP']:.2f}")
+                        if 'Mean Temperature' in cluster_data:
+                            st.write(f"**Mean Temperature:** {cluster_data['Mean Temperature']:.2f}K")
+                            st.write(f"**Max Temperature:** {cluster_data['Max Temperature']:.2f}K")
+                    
+                    # Add a help tooltip
+                    st.info("""
+                    **FRP** (Fire Radiative Power) is measured in megawatts (MW) and indicates the intensity of the fire.
+                    Higher values suggest more intense burning.
+                    """)
 
 if __name__ == "__main__":
     main()
