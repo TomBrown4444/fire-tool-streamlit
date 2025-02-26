@@ -1,0 +1,20 @@
+[project]
+name = "fires"
+version = "0.1.0"
+description = "Fire analysis tool in streamlit"
+authors = [
+    {name = "Tom Brown",email = "tom.brown2678@gmail.com"}
+]
+license = {text = "Creative Commons"}
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "streamlit (>=1.42.1,<2.0.0)",
+    "pandas (>=2.2.3,<3.0.0)",
+    "matplotlib (>=3.10.0,<4.0.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
