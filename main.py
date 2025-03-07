@@ -2,11 +2,18 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from sklearn.cluster import DBSCAN
+from sklearn.cluster import DBSCAN, OPTICS
+import hdbscan
 import requests
 from datetime import datetime, timedelta
 from io import StringIO
 import matplotlib.colors as mcolors
+from matplotlib.colors import LinearSegmentedColormap
+# Add folium related imports
+import folium
+from folium.plugins import MarkerCluster, HeatMap
+from branca.colormap import LinearColormap
+import streamlit.components.v1 as components
 
 # Set page config
 st.set_page_config(
@@ -23,6 +30,13 @@ if 'results' not in st.session_state:
     st.session_state.results = None
 if 'selected_cluster' not in st.session_state:
     st.session_state.selected_cluster = None
+# Add new session state variables for playback functionality
+if 'playback_mode' not in st.session_state:
+    st.session_state.playback_mode = False
+if 'playback_dates' not in st.session_state:
+    st.session_state.playback_dates = []
+if 'playback_index' not in st.session_state:
+    st.session_state.playback_index = 0
 
 class FIRMSHandler:
     def __init__(self, username, password, api_key):
@@ -94,6 +108,11 @@ class FIRMSHandler:
             st.error("Provide a country or bounding box")
             return None
 
+        # Check if the country is large and show a message
+        large_countries = ['United States', 'China', 'Russia', 'Canada', 'Brazil', 'Australia', 'India']
+        if country in large_countries:
+            st.info(f"Fetching data for {country}, which may take longer due to the size of the country. Please be patient...")
+            
         url = f"{self.base_url}{self.api_key}/{dataset}/{bbox}/7"
         
         with st.spinner('Fetching data...'):
@@ -118,75 +137,188 @@ class FIRMSHandler:
                 st.error(f"Error fetching data: {str(e)}")
                 return None
 
-def plot_fire_detections(df, title="Fire Detections", selected_cluster=None):
-    """Plot fire detections using matplotlib with highlighted clusters"""
-    fig, ax = plt.subplots(figsize=(10, 8))
-    
-    # Separate the data based on the selected cluster
-    if selected_cluster is not None and selected_cluster in df['cluster'].values:
-        highlighted_points = df[df['cluster'] == selected_cluster]
-        other_points = df[df['cluster'] != selected_cluster]
-        
-        # Plot other points with lower alpha
-        scatter1 = ax.scatter(
-            other_points['longitude'], 
-            other_points['latitude'],
-            c=other_points['cluster'],
-            cmap='viridis',
-            s=50,
-            alpha=0.3
-        )
-        
-        # Plot highlighted points with higher alpha and larger size
-        scatter2 = ax.scatter(
-            highlighted_points['longitude'], 
-            highlighted_points['latitude'],
-            c=highlighted_points['cluster'],
-            cmap='viridis',
-            s=80,
-            alpha=0.9,
-            edgecolors='yellow',
-            linewidths=1
-        )
+def get_temp_column(df):
+    """Determine which temperature column to use based on available data"""
+    if 'bright_ti4' in df.columns:
+        return 'bright_ti4'
+    elif 'brightness' in df.columns:
+        return 'brightness'
     else:
-        # Plot all points normally
-        scatter1 = ax.scatter(
-            df['longitude'], 
-            df['latitude'],
-            c=df['cluster'],
-            cmap='viridis',
-            s=50,
-            alpha=0.6
+        return None
+
+def plot_fire_detections_folium(df, title="Fire Detections", selected_cluster=None, playback_mode=False, playback_date=None):
+    """Plot fire detections on a folium map with inferno color palette based on temperature"""
+    # Create a working copy of the dataframe
+    plot_df = df.copy()
+    
+    # Filter data for playback mode
+    if playback_mode and playback_date is not None:
+        plot_df = df[df['acq_date'] == playback_date]
+        title = f"{title} - {playback_date}"
+    
+    # Check if there is any data to plot
+    if plot_df.empty:
+        st.warning("No data to plot for the selected filters.")
+        return None
+    
+    # Determine which temperature column to use
+    temp_col = get_temp_column(plot_df)
+    
+    # Create a map centered on the mean coordinates
+    center_lat = plot_df['latitude'].mean()
+    center_lon = plot_df['longitude'].mean()
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=6, control_scale=True)
+    
+    # Add a title to the map
+    title_html = f'''
+             <h3 align="center" style="font-size:16px"><b>{title}</b></h3>
+             '''
+    m.get_root().html.add_child(folium.Element(title_html))
+    
+    # Create feature groups for different sets of points
+    fg_all = folium.FeatureGroup(name="All Points")
+    fg_selected = folium.FeatureGroup(name="Selected Cluster")
+    
+    # Create colormap for temperature (inferno palette)
+    if temp_col:
+        # Inferno color palette approximation
+        inferno_colors = ['#000004', '#160b39', '#420a68', '#6a176e', '#932667', '#ba3655', '#dd513a', '#f3771a', '#fca50a', '#f6d746', '#fcffa4']
+        vmin = plot_df[temp_col].min()
+        vmax = plot_df[temp_col].max()
+        colormap = LinearColormap(
+            inferno_colors,
+            vmin=vmin, 
+            vmax=vmax,
+            caption=f'Temperature (K)'
         )
     
-    # Add a colorbar
-    cbar = plt.colorbar(scatter1, label='Cluster ID')
+    # Process data based on selection state
+    if selected_cluster is not None and selected_cluster in plot_df['cluster'].values:
+        # Split data into selected and unselected
+        selected_data = plot_df[plot_df['cluster'] == selected_cluster]
+        other_data = plot_df[plot_df['cluster'] != selected_cluster]
+        
+        # Add unselected clusters if not in playback mode
+        if not other_data.empty and not playback_mode:
+            for _, point in other_data.iterrows():
+                if temp_col and not pd.isna(point[temp_col]):
+                    color = colormap(point[temp_col])
+                else:
+                    color = '#3186cc'  # Default blue
+                
+                popup_text = f"""
+                <b>Cluster:</b> {point['cluster']}<br>
+                <b>Date:</b> {point['acq_date']}<br>
+                <b>Time:</b> {point['acq_time']}<br>
+                <b>FRP:</b> {point['frp']:.2f}<br>
+                """
+                if temp_col and not pd.isna(point[temp_col]):
+                    popup_text += f"<b>Temperature:</b> {point[temp_col]:.2f}K<br>"
+                
+                folium.CircleMarker(
+                    location=[point['latitude'], point['longitude']],
+                    radius=5,
+                    color=color,
+                    fill=True,
+                    fill_color=color,
+                    fill_opacity=0.5,
+                    popup=folium.Popup(popup_text, max_width=300),
+                    tooltip=f"Cluster {point['cluster']}"
+                ).add_to(fg_all)
+        
+        # Add selected cluster with different style
+        if not selected_data.empty:
+            for _, point in selected_data.iterrows():
+                if temp_col and not pd.isna(point[temp_col]):
+                    color = colormap(point[temp_col])
+                else:
+                    color = '#ff3300'  # Default red
+                
+                popup_text = f"""
+                <b>Cluster:</b> {point['cluster']}<br>
+                <b>Date:</b> {point['acq_date']}<br>
+                <b>Time:</b> {point['acq_time']}<br>
+                <b>FRP:</b> {point['frp']:.2f}<br>
+                """
+                if temp_col and not pd.isna(point[temp_col]):
+                    popup_text += f"<b>Temperature:</b> {point[temp_col]:.2f}K<br>"
+                
+                folium.CircleMarker(
+                    location=[point['latitude'], point['longitude']],
+                    radius=8,
+                    color='black',
+                    weight=1.5,
+                    fill=True,
+                    fill_color=color,
+                    fill_opacity=0.9,
+                    popup=folium.Popup(popup_text, max_width=300),
+                    tooltip=f"Cluster {point['cluster']} - Selected"
+                ).add_to(fg_selected)
+    else:
+        # Add all points with default style
+        for _, point in plot_df.iterrows():
+            if temp_col and not pd.isna(point[temp_col]):
+                color = colormap(point[temp_col])
+            else:
+                color = '#3186cc'  # Default blue
+            
+            popup_text = f"""
+            <b>Cluster:</b> {point['cluster']}<br>
+            <b>Date:</b> {point['acq_date']}<br>
+            <b>Time:</b> {point['acq_time']}<br>
+            <b>FRP:</b> {point['frp']:.2f}<br>
+            """
+            if temp_col and not pd.isna(point[temp_col]):
+                popup_text += f"<b>Temperature:</b> {point[temp_col]:.2f}K<br>"
+            
+            folium.CircleMarker(
+                location=[point['latitude'], point['longitude']],
+                radius=6,
+                color=color,
+                fill=True,
+                fill_color=color,
+                fill_opacity=0.7,
+                popup=folium.Popup(popup_text, max_width=300),
+                tooltip=f"Cluster {point['cluster']}"
+            ).add_to(fg_all)
     
-    # Set plot title and labels
-    ax.set_title(title, pad=20, fontsize=14)
-    ax.set_xlabel('Longitude', fontsize=12)
-    ax.set_ylabel('Latitude', fontsize=12)
-    ax.grid(True, linestyle='--', alpha=0.7)
+    # Add feature groups to map
+    fg_all.add_to(m)
+    fg_selected.add_to(m)
     
-    # Add coordinate annotations
-    ax.text(0.01, 0.01, 'Click on a cluster in the table to highlight it on the map',
-            transform=ax.transAxes, fontsize=10, bbox=dict(facecolor='white', alpha=0.7))
+    # Add layer control
+    folium.LayerControl().add_to(m)
     
-    # For selected clusters, add an information box
-    if selected_cluster is not None and selected_cluster in df['cluster'].values:
-        cluster_data = df[df['cluster'] == selected_cluster]
-        info_text = (
-            f"Cluster: {selected_cluster}\n"
-            f"Points: {len(cluster_data)}\n"
-            f"Mean Lat: {cluster_data['latitude'].mean():.4f}\n"
-            f"Mean Long: {cluster_data['longitude'].mean():.4f}\n"
-            f"Mean FRP: {cluster_data['frp'].mean():.2f}"
-        )
-        ax.text(0.99, 0.99, info_text, transform=ax.transAxes, fontsize=10,
-                verticalalignment='top', horizontalalignment='right',
-                bbox=dict(facecolor='white', alpha=0.7))
+    # Add colormap to map if temperature data is available
+    if temp_col:
+        colormap.add_to(m)
     
-    return fig
+    # Add basemap layers with proper attribution
+    folium.TileLayer(
+        'cartodbpositron', 
+        name='Light Map',
+        attr='© <a href="http://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors, © <a href="https://carto.com/attribution">CARTO</a>'
+    ).add_to(m)
+    
+    folium.TileLayer(
+        'cartodbdark_matter', 
+        name='Dark Map',
+        attr='© <a href="http://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors, © <a href="https://carto.com/attribution">CARTO</a>'
+    ).add_to(m)
+    
+    folium.TileLayer(
+        'stamenterrain', 
+        name='Terrain Map',
+        attr='Map tiles by <a href="http://stamen.com">Stamen Design</a>, under <a href="http://creativecommons.org/licenses/by/3.0">CC BY 3.0</a>. Data by <a href="http://openstreetmap.org">OpenStreetMap</a>, under <a href="http://www.openstreetmap.org/copyright">ODbL</a>.'
+    ).add_to(m)
+    
+    folium.TileLayer(
+        'stamentoner', 
+        name='Toner Map',
+        attr='Map tiles by <a href="http://stamen.com">Stamen Design</a>, under <a href="http://creativecommons.org/licenses/by/3.0">CC BY 3.0</a>. Data by <a href="http://openstreetmap.org">OpenStreetMap</a>, under <a href="http://www.openstreetmap.org/copyright">ODbL</a>.'
+    ).add_to(m)
+    
+    return m
 
 def create_cluster_summary(df):
     """Create summary statistics for each cluster"""
@@ -209,30 +341,40 @@ def create_cluster_summary(df):
     ]
     
     # Add temperature statistics based on dataset type
-    if 'bright_ti4' in df.columns:
-        temp_stats = df[df['cluster'] != -1].groupby('cluster')['bright_ti4'].agg(['mean', 'max']).round(2)
-        cluster_summary['Mean Temperature'] = temp_stats['mean']
-        cluster_summary['Max Temperature'] = temp_stats['max']
-    elif 'brightness' in df.columns:
-        temp_stats = df[df['cluster'] != -1].groupby('cluster')['brightness'].agg(['mean', 'max']).round(2)
+    temp_col = get_temp_column(df)
+    if temp_col:
+        temp_stats = df[df['cluster'] != -1].groupby('cluster')[temp_col].agg(['mean', 'max']).round(2)
         cluster_summary['Mean Temperature'] = temp_stats['mean']
         cluster_summary['Max Temperature'] = temp_stats['max']
     
     return cluster_summary.reset_index()
 
-def display_coordinate_view(df):
+def display_coordinate_view(df, playback_date=None):
     """Display a table with coordinates and details for the selected cluster"""
     if df is None or df.empty:
         return
     
     if st.session_state.selected_cluster is not None:
+        # Filter for the selected cluster
         cluster_points = df[df['cluster'] == st.session_state.selected_cluster]
         
+        # If in playback mode, further filter by date
+        if playback_date is not None:
+            cluster_points = cluster_points[cluster_points['acq_date'] == playback_date]
+        
         if not cluster_points.empty:
-            st.subheader(f"Points in Cluster {st.session_state.selected_cluster}")
+            if playback_date is not None:
+                st.subheader(f"Points in Cluster {st.session_state.selected_cluster} on {playback_date}")
+            else:
+                st.subheader(f"Points in Cluster {st.session_state.selected_cluster}")
             
             # Create a display version of the dataframe with formatted columns
             display_df = cluster_points[['latitude', 'longitude', 'frp', 'acq_date', 'acq_time']].copy()
+            
+            # Add temperature column if available
+            temp_col = get_temp_column(df)
+            if temp_col:
+                display_df['temperature'] = cluster_points[temp_col]
             
             # Add a formatted coordinate column
             display_df['Coordinates'] = display_df.apply(
@@ -240,14 +382,20 @@ def display_coordinate_view(df):
                 axis=1
             )
             
+            # Display columns
+            display_columns = ['Coordinates', 'frp', 'acq_date', 'acq_time']
+            if temp_col:
+                display_columns.append('temperature')
+                
             # Display the dataframe
             st.dataframe(
-                display_df[['Coordinates', 'frp', 'acq_date', 'acq_time']],
+                display_df[display_columns],
                 column_config={
                     "Coordinates": "Lat, Long",
                     "frp": st.column_config.NumberColumn("FRP", format="%.2f"),
                     "acq_date": "Date",
-                    "acq_time": "Time"
+                    "acq_time": "Time",
+                    "temperature": st.column_config.NumberColumn("Temp (K)", format="%.2f")
                 },
                 hide_index=True,
                 use_container_width=True
@@ -354,6 +502,16 @@ def main():
       max_value=default_end_date
     )
     
+    # Calculate date range in days
+    date_range_days = (end_date - start_date).days
+    
+    # Define large countries that might be slow with wide date ranges
+    large_countries = ['United States', 'China', 'Russia', 'Canada', 'Brazil', 'Australia', 'India']
+    
+    # Show warning for large countries with wide date ranges
+    if country in large_countries and date_range_days > 14:
+        st.sidebar.warning(f"⚠️ You selected a {date_range_days}-day period for {country}, which is a large country. This may take a long time to process. Consider reducing your date range to 14 days or less for faster results.")
+    
     # API credentials (hidden in expander)
     with st.sidebar.expander("API Settings"):
         username = st.text_input("FIRMS Username", value="tombrown4444")
@@ -361,7 +519,23 @@ def main():
         api_key = st.text_input("FIRMS API Key", value="897a9b7869fd5e4ad231573e14e1c8c8")
     
     # Generate button
-    if st.sidebar.button("Generate Analysis"):
+    generate_button = st.sidebar.button("Generate Analysis")
+    
+    # Add logic to check if we should proceed with analysis
+    proceed_with_analysis = True
+    
+    # If date range is too wide for large countries, show confirmation dialog
+    if generate_button and country in large_countries and date_range_days > 14:
+        proceed_with_analysis = st.sidebar.checkbox(
+            "I understand this may take a long time. Proceed anyway?",
+            value=False,
+            help="Large date ranges for big countries can take several minutes to process."
+        )
+        
+        if not proceed_with_analysis:
+            st.sidebar.info("Please adjust your date range or click the checkbox to proceed.")
+    
+    if generate_button and proceed_with_analysis:
         with st.spinner("Analyzing fire data..."):
             handler = FIRMSHandler(username, password, api_key)
             results = handler.fetch_fire_data(
@@ -374,6 +548,8 @@ def main():
             st.session_state.results = results
             # Reset selected cluster
             st.session_state.selected_cluster = None
+            # Reset playback mode
+            st.session_state.playback_mode = False
     
     # Display results in two columns
     if st.session_state.results is not None and not st.session_state.results.empty:
@@ -382,28 +558,104 @@ def main():
         with col1:
             st.subheader("Fire Detection Map")
             
-            # Create the matplotlib visualization
-            fig = plot_fire_detections(
-                st.session_state.results, 
-                f"Fire Clusters - {country}", 
-                st.session_state.selected_cluster
-            )
-            
-            # Display the matplotlib figure
-            st.pyplot(fig)
-            
-            # Add a map info section
-            with st.expander("Map Information"):
-                st.write("""
-                - **Points** represent fire detections from satellite data
-                - **Colors** indicate different fire clusters identified by DBSCAN
-                - **Highlighted points** (yellow border) are from the selected cluster
-                - **Coordinate data** is displayed in the table below when a cluster is selected
-                """)
-            
-            # Display coordinate table for selected cluster
-            display_coordinate_view(st.session_state.results)
-            
+            # Check if we're in playback mode
+            if not st.session_state.playback_mode:
+                # Create the folium visualization (normal mode)
+                folium_map = plot_fire_detections_folium(
+                    st.session_state.results, 
+                    f"Fire Clusters - {country}", 
+                    st.session_state.selected_cluster
+                )
+                
+                if folium_map:
+                    # Save the map to an HTML string and display it using components
+                    html_map = folium_map._repr_html_()
+                    components.html(html_map, height=600, width=700)
+                    
+                    # Add a map info section
+                    with st.expander("Map Information"):
+                        st.write("""
+                        - **Points** represent fire detections from satellite data
+                        - **Colors** indicate temperature using the inferno color palette (yellow/white = hottest, purple/black = coolest)
+                        - **Highlighted points** (black outline) are from the selected cluster
+                        - **Popup information** displays when clicking on a point
+                        - **Layer control** in the top right allows toggling different layers
+                        - **Basemap options** can be changed using the layer control
+                        - **Coordinate data** is displayed in the table below when a cluster is selected
+                        """)
+                    
+                    # Display coordinate table for selected cluster
+                    display_coordinate_view(st.session_state.results)
+                else:
+                    st.warning("No data to display on the map.")
+            else:
+                # We're in playback mode - get current date
+                current_date = st.session_state.playback_dates[st.session_state.playback_index]
+                
+                # Add exit button for playback mode
+                if st.button("Exit Play Back"):
+                    st.session_state.playback_mode = False
+                    st.rerun()
+                
+                # Create the playback visualization
+                playback_title = f"Cluster {st.session_state.selected_cluster} - {current_date}"
+                
+                # Get only the data for the selected cluster and date
+                playback_data = st.session_state.results[
+                    (st.session_state.results['cluster'] == st.session_state.selected_cluster) &
+                    (st.session_state.results['acq_date'] == current_date)
+                ]
+                
+                folium_map = plot_fire_detections_folium(
+                    playback_data,
+                    playback_title,
+                    st.session_state.selected_cluster,
+                    True,
+                    current_date
+                )
+                
+                if folium_map:
+                    # Save the map to an HTML string and display it using components
+                    html_map = folium_map._repr_html_()
+                    components.html(html_map, height=600, width=700)
+                    
+                    # Add the time slider (only if there are enough dates)
+                    if len(st.session_state.playback_dates) > 1:
+                        st.write("### Timeline")
+                        date_index = st.slider(
+                            "Select Date", 
+                            0, 
+                            len(st.session_state.playback_dates) - 1, 
+                            st.session_state.playback_index
+                        )
+                        
+                        # Update index if changed
+                        if date_index != st.session_state.playback_index:
+                            st.session_state.playback_index = date_index
+                            st.rerun()
+                    else:
+                        st.write("Not enough dates for playback.")
+                    
+                    # Show current timeline info
+                    st.write(f"**Date: {current_date}** (Day {st.session_state.playback_index + 1} of {len(st.session_state.playback_dates)})")
+                    
+                    # Display statistics for this date
+                    st.write("### Daily Statistics")
+                    st.write(f"**Detection points:** {len(playback_data)}")
+                    if not playback_data.empty:
+                        st.write(f"**Mean FRP:** {playback_data['frp'].mean():.2f}")
+                        
+                        # Display temperature if available
+                        temp_col = get_temp_column(playback_data)
+                        if temp_col:
+                            st.write(f"**Mean Temperature:** {playback_data[temp_col].mean():.2f}K")
+                            st.write(f"**Max Temperature:** {playback_data[temp_col].max():.2f}K")
+                    
+                    # Display coordinate view for just this date
+                    display_coordinate_view(st.session_state.results, current_date)
+                else:
+                    st.warning("No data to display for this date.")
+        
         with col2:
             st.subheader("Cluster Summary")
             
@@ -422,6 +674,19 @@ def main():
                 if selected_from_table != "None":
                     cluster_id = int(selected_from_table.split(' ')[1])
                     st.session_state.selected_cluster = cluster_id
+                    
+                    # Add Play Back button if we have a selected cluster and we're not already in playback mode
+                    if not st.session_state.playback_mode:
+                        if st.button("Play Back"):
+                            # Get unique dates for the selected cluster
+                            cluster_points = st.session_state.results[st.session_state.results['cluster'] == st.session_state.selected_cluster]
+                            unique_dates = sorted(cluster_points['acq_date'].unique())
+                            
+                            # Store the dates and initialize to the first one
+                            st.session_state.playback_dates = unique_dates
+                            st.session_state.playback_index = 0
+                            st.session_state.playback_mode = True
+                            st.rerun()
                 else:
                     st.session_state.selected_cluster = None
                 
@@ -484,6 +749,15 @@ def main():
                     **FRP** (Fire Radiative Power) is measured in megawatts (MW) and indicates the intensity of the fire.
                     Higher values suggest more intense burning.
                     """)
+                    
+                    # Add temperature explanation if available
+                    if 'Mean Temperature' in cluster_data:
+                        st.info("""
+                        **Temperature coloring**: 
+                        - Yellow/White indicates the hottest areas (higher temperature)
+                        - Orange/Red shows medium temperature
+                        - Purple/Black indicates lower temperature
+                        """)
 
 if __name__ == "__main__":
     main()
