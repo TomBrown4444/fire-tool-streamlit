@@ -14,6 +14,8 @@ import folium
 from folium.plugins import MarkerCluster, HeatMap
 from branca.colormap import LinearColormap
 import streamlit.components.v1 as components
+import altair as alt
+import json
 
 # Set page config
 st.set_page_config(
@@ -39,6 +41,158 @@ if 'playback_dates' not in st.session_state:
     st.session_state.playback_dates = []
 if 'playback_index' not in st.session_state:
     st.session_state.playback_index = 0
+# Add session state for selected features and sidebar state
+if 'selected_features' not in st.session_state:
+    st.session_state.selected_features = ['frp', 'bright_ti4']
+if 'sidebar_visible' not in st.session_state:
+    st.session_state.sidebar_visible = True
+# Add session state for export functionality
+if 'frames' not in st.session_state:
+    st.session_state.frames = []
+if 'is_recording' not in st.session_state:
+    st.session_state.is_recording = False
+
+def export_timeline(df, cluster_id, category, playback_dates, basemap_tiles, basemap):
+    """Create a timeline export as GIF or MP4"""
+    if not playback_dates or cluster_id is None:
+        st.warning("No timeline data available to export")
+        return
+    
+    # Set up progress bar
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    # Capture frames for each date
+    frames = []
+    total_dates = len(playback_dates)
+    
+    for i, date in enumerate(playback_dates):
+        status_text.write(f"Processing frame {i+1}/{total_dates}: {date}")
+        progress_bar.progress((i+1)/total_dates)
+        
+        # Create map for this date
+        playback_title = f"{get_category_display_name(category)} {cluster_id} - {date}"
+        
+        # Filter data for this date and cluster
+        date_data = df[(df['cluster'] == cluster_id) & (df['acq_date'] == date)].copy()
+        
+        if not date_data.empty:
+            # Create a simplified map for export
+            folium_map = create_export_map(date_data, playback_title, basemap_tiles, basemap)
+            frames.append(folium_map)
+    
+    status_text.write("Processing complete. Preparing download...")
+    
+    # Store frames in session state
+    st.session_state.frames = frames
+    
+    # Provide download option
+    if frames:
+        # Create download buffer
+        st.info("Timeline export ready for download")
+        st.download_button(
+            label="Download as GIF",
+            data=create_gif_from_frames(frames),
+            file_name=f"{category}_{cluster_id}_timeline.gif",
+            mime="image/gif",
+            use_container_width=True
+        )
+        progress_bar.empty()
+        status_text.empty()
+    else:
+        st.error("Failed to create timeline export")
+        progress_bar.empty()
+        status_text.empty()
+
+def create_export_map(data, title, basemap_tiles, basemap):
+    """Create a simplified map for export"""
+    # Similar to plot_fire_detections_folium but optimized for export
+    if data.empty:
+        return None
+    
+    # Calculate the bounding box
+    min_lat = data['latitude'].min()
+    max_lat = data['latitude'].max()
+    min_lon = data['longitude'].min()
+    max_lon = data['longitude'].max()
+    
+    # Create a map centered on the mean coordinates
+    center_lat = (min_lat + max_lat) / 2
+    center_lon = (min_lon + max_lon) / 2
+    
+    # Set the initial tiles based on basemap
+    initial_tiles = 'cartodbdark_matter'
+    if basemap in basemap_tiles:
+        initial_tiles = basemap_tiles[basemap]
+    
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=10, 
+                  tiles=initial_tiles)
+    
+    # Add the title
+    title_html = f'''
+             <h3 align="center" style="font-size:16px; color: white;"><b>{title}</b></h3>
+             '''
+    m.get_root().html.add_child(folium.Element(title_html))
+    
+    # Plot the points
+    for idx, point in data.iterrows():
+        folium.CircleMarker(
+            location=[point['latitude'], point['longitude']],
+            radius=6,
+            color='white',
+            weight=1.5,
+            fill=True,
+            fill_color='#ff3300',  # Red for visibility
+            fill_opacity=0.9
+        ).add_to(m)
+    
+    # Save to HTML string
+    html_string = m._repr_html_()
+    return html_string
+
+def create_gif_from_frames(frames):
+    """Create a GIF from HTML frames using a placeholder implementation"""
+    # This is a placeholder - in a real implementation, you would:
+    # 1. Render each HTML frame to an image
+    # 2. Use a library like PIL or imageio to create a GIF
+    # 3. Return the binary data of the GIF
+    
+    # For now, we'll just return a simple placeholder GIF
+    from io import BytesIO
+    from PIL import Image, ImageDraw, ImageFont
+    
+    frames_pil = []
+    for i in range(len(frames)):
+        # Create a placeholder image for each frame
+        img = Image.new('RGB', (800, 600), color=(30, 30, 30))
+        draw = ImageDraw.Draw(img)
+        draw.text((400, 300), f"Frame {i+1}/{len(frames)}", fill=(255, 255, 255))
+        frames_pil.append(img)
+    
+    # Save as GIF
+    gif_buffer = BytesIO()
+    frames_pil[0].save(
+        gif_buffer,
+        format='GIF',
+        append_images=frames_pil[1:],
+        save_all=True,
+        duration=500,  # 500ms per frame
+        loop=0  # Loop forever
+    )
+    gif_buffer.seek(0)
+    return gif_buffer.getvalue()
+
+# Category display name mapping
+def get_category_display_name(category):
+    """Return the display name for a category"""
+    if category == "fires":
+        return "Fire"
+    elif category == "flares":
+        return "Flare"
+    elif category == "volcanoes":
+        return "Volcano"
+    else:
+        return "Cluster"  # Default for raw data
 
 class FIRMSHandler:
     def __init__(self, username, password, api_key):
@@ -320,16 +474,22 @@ def get_temp_column(df):
     else:
         return None
 
-def plot_fire_detections_folium(df, title="Fire Detections", selected_cluster=None, playback_mode=False, playback_date=None, dot_size_multiplier=1.0, color_palette='inferno'):
+def plot_fire_detections_folium(df, title="Fire Detections", selected_cluster=None, playback_mode=False, playback_date=None, dot_size_multiplier=1.0, color_palette='inferno', category="fires"):
     """Plot fire detections on a folium map with color palette based on temperature"""
     # Create a working copy of the dataframe
     plot_df = df.copy()
+    
+    # Filter out noise points (-1) if category is not raw data
+    if category != "raw data":
+        plot_df = plot_df[plot_df['cluster'] >= 0].copy()
     
     # Apply cluster selection filter if a cluster is selected
     if selected_cluster is not None and selected_cluster in plot_df['cluster'].values:
         # Filter for just the selected cluster
         plot_df = plot_df[plot_df['cluster'] == selected_cluster].copy()
-        title = f"{title} - Cluster {selected_cluster}"
+        # Get category display name for title
+        category_display = get_category_display_name(category)
+        title = f"{title} - {category_display} {selected_cluster}"
     
     # Then apply playback filter if in playback mode
     if playback_mode and playback_date is not None:
@@ -396,7 +556,7 @@ def plot_fire_detections_folium(df, title="Fire Detections", selected_cluster=No
     
     # Create feature groups for different sets of points
     fg_all = folium.FeatureGroup(name="All Points")
-    fg_selected = folium.FeatureGroup(name="Selected Cluster")
+    fg_selected = folium.FeatureGroup(name="Selected Points")
     
     # Define different color palettes
     color_palettes = {
@@ -585,12 +745,22 @@ def plot_fire_detections_folium(df, title="Fire Detections", selected_cluster=No
     
     return m
 
-def create_cluster_summary(df):
+def create_cluster_summary(df, category="fires"):
     """Create summary statistics for each cluster"""
     if df is None or df.empty:
         return None
+    
+    # Filter out noise points (-1) if category is not raw data
+    if category != "raw data":
+        summary_df = df[df['cluster'] >= 0].copy()
+    else:
+        summary_df = df.copy()
         
-    cluster_summary = (df[df['cluster'] != -1]
+    if summary_df.empty:
+        st.warning("No valid clusters found after filtering.")
+        return None
+        
+    cluster_summary = (summary_df
                       .groupby('cluster')
                       .agg({
                           'latitude': ['count', 'mean'],
@@ -608,11 +778,159 @@ def create_cluster_summary(df):
     # Add temperature statistics based on dataset type
     temp_col = get_temp_column(df)
     if temp_col:
-        temp_stats = df[df['cluster'] != -1].groupby('cluster')[temp_col].agg(['mean', 'max']).round(2)
+        temp_stats = summary_df.groupby('cluster')[temp_col].agg(['mean', 'max']).round(2)
         cluster_summary['Mean Temperature'] = temp_stats['mean']
         cluster_summary['Max Temperature'] = temp_stats['max']
     
     return cluster_summary.reset_index()
+
+def plot_feature_time_series(df, cluster_id, features):
+    """Generate time series plots for selected features of a cluster"""
+    if df is None or df.empty or cluster_id is None:
+        return None
+    
+    # Filter for the selected cluster
+    cluster_data = df[df['cluster'] == cluster_id].copy()
+    
+    if cluster_data.empty:
+        return None
+    
+    # Create a daily summary with mean, max for each feature
+    daily_data = []
+    
+    for date in sorted(cluster_data['acq_date'].unique()):
+        day_data = {'date': date}
+        day_df = cluster_data[cluster_data['acq_date'] == date]
+        
+        # Calculate stats for requested features
+        for feature in features:
+            if feature in cluster_data.columns:
+                day_data[f'{feature}_mean'] = day_df[feature].mean()
+                day_data[f'{feature}_max'] = day_df[feature].max()
+                day_data[f'{feature}_min'] = day_df[feature].min()
+                day_data[f'{feature}_count'] = day_df[feature].count()
+        
+        daily_data.append(day_data)
+    
+    # Create dataframe from daily summaries
+    if not daily_data:
+        return None
+        
+    daily_df = pd.DataFrame(daily_data)
+    
+    # Convert date column to datetime
+    daily_df['date'] = pd.to_datetime(daily_df['date'])
+    
+    # Feature display names and descriptions
+    feature_info = {
+        'frp': {
+            'display_name': 'Fire Radiative Power (MW)',
+            'description': 'Fire Radiative Power (FRP) measures the rate of emitted energy from a fire in megawatts (MW). Higher values indicate more intense burning.'
+        },
+        'bright_ti4': {
+            'display_name': 'Brightness (K)',
+            'description': 'Brightness Temperature is measured in Kelvin (K) and indicates how hot the fire is. Higher values indicate hotter fires.'
+        }
+    }
+    
+    # Create chart data for combined visualization
+    chart_data = pd.DataFrame({'date': daily_df['date']})
+    
+    # Add data for each selected feature
+    for feature in features:
+        if f'{feature}_mean' in daily_df.columns:
+            feature_display = feature_info.get(feature, {}).get('display_name', feature)
+            chart_data[feature_display] = daily_df[f'{feature}_mean']
+    
+    # Melt the dataframe for Altair to create lines for each feature
+    melted_data = pd.melt(
+        chart_data, 
+        id_vars=['date'], 
+        var_name='Feature', 
+        value_name='Value'
+    )
+    
+    # Create a single combined chart with all selected features
+    combined_chart = alt.Chart(melted_data).mark_line(point=True).encode(
+        x=alt.X('date:T', title='Date'),
+        y=alt.Y('Value:Q', title='Value'),
+        color=alt.Color('Feature:N', legend=alt.Legend(title='Feature')),
+        tooltip=['date:T', 'Value:Q', 'Feature:N']
+    ).properties(
+        title='Fire Evolution Over Time',
+        width=600,
+        height=300
+    ).interactive()
+    
+    return combined_chart, feature_info
+
+def display_feature_exploration(df, cluster_id, category):
+    """Display feature exploration interface for the selected cluster"""
+    if df is None or df.empty or cluster_id is None:
+        return
+    
+    # Filter data for the selected cluster
+    cluster_data = df[df['cluster'] == cluster_id].copy()
+    
+    if cluster_data.empty:
+        st.warning(f"No data available for selected {get_category_display_name(category).lower()}.")
+        return
+    
+    # Limit to only 'frp' and 'bright_ti4' features
+    available_features = []
+    
+    if 'frp' in cluster_data.columns:
+        available_features.append('frp')
+        
+    temp_col = get_temp_column(df)
+    if temp_col and temp_col in cluster_data.columns:
+        available_features.append(temp_col)
+    
+    # Fixed features with better names
+    feature_display_names = {
+        'frp': 'Fire Radiative Power',
+        'bright_ti4': 'Brightness'
+    }
+    
+    # Feature selection checkboxes - horizontal arrangement
+    st.write(f"### {get_category_display_name(category)} {cluster_id} Evolution Over Time")
+    
+    cols = st.columns([1, 1, 3])
+    
+    selected_features = []
+    
+    with cols[0]:
+        if 'frp' in available_features:
+            show_frp = st.checkbox("Fire Radiative Power", value=True, key="show_frp")
+            if show_frp:
+                selected_features.append('frp')
+    
+    with cols[1]:
+        if temp_col in available_features:
+            show_temp = st.checkbox("Brightness", value=False, key="show_temp")  # Default to off
+            if show_temp:
+                selected_features.append(temp_col)
+    
+    # Generate and display a single combined chart for selected features
+    if selected_features:
+        # Unpack the tuple correctly - we expect (chart, feature_info)
+        result = plot_feature_time_series(df, cluster_id, selected_features)
+        
+        if result and isinstance(result, tuple) and len(result) == 2:
+            chart, feature_info = result
+            
+            # Display chart
+            st.altair_chart(chart, use_container_width=True)
+            
+            # Add hover explanations
+            with st.expander("What do these metrics mean?"):
+                for feature in selected_features:
+                    if feature in feature_info:
+                        st.write(f"**{feature_info[feature]['display_name']}**: {feature_info[feature]['description']}")
+        else:
+            st.warning("Not enough time-series data to generate chart.")
+    else:
+        st.info("Please select at least one feature to visualize.")
 
 def display_coordinate_view(df, playback_date=None):
     """Display a table with coordinates and details for the selected cluster"""
@@ -632,7 +950,10 @@ def display_coordinate_view(df, playback_date=None):
             if playback_date is not None:
                 st.subheader(f"Points in Cluster {st.session_state.selected_cluster} on {playback_date}")
             else:
-                st.subheader(f"Points in Cluster {st.session_state.selected_cluster}")
+                if not st.session_state.playback_mode:
+                    st.subheader(f"Point Details in Cluster {st.session_state.selected_cluster}")
+                else:
+                    st.subheader(f"Point Details in Cluster {st.session_state.selected_cluster} on {st.session_state.playback_dates[st.session_state.playback_index]}")
             
             # Create a display version of the dataframe with formatted columns
             display_df = cluster_points[['latitude', 'longitude', 'frp', 'acq_date', 'acq_time']].copy()
@@ -672,14 +993,111 @@ def display_coordinate_view(df, playback_date=None):
     else:
         st.info("Select a cluster to view detailed point information.")
 
+def create_arrow_navigation(key_suffix=""):
+    """Create arrow navigation buttons and JavaScript for keyboard navigation"""
+    # Create button columns for navigation
+    col1, col2, col3 = st.columns([1, 4, 1])
+    
+    with col1:
+        prev_key = f"prev_btn_{key_suffix}" if key_suffix else "prev_btn"
+        prev_clicked = st.button("◀", key=prev_key, help="Previous Date (Left Arrow)", on_click=None)
+        if prev_clicked and st.session_state.playback_index > 0:
+            st.session_state.playback_index -= 1
+            st.rerun()
+    
+    with col2:
+        if st.session_state.playback_dates and st.session_state.playback_mode:
+            current_date = st.session_state.playback_dates[st.session_state.playback_index]
+            total_dates = len(st.session_state.playback_dates)
+            
+            # Date slider
+            slider_key = f"date_slider_{key_suffix}" if key_suffix else "date_slider_direct"
+            date_index = st.slider(
+                "Select Date", 
+                0, 
+                total_dates - 1, 
+                st.session_state.playback_index,
+                key=slider_key,
+                help="Use slider or arrow buttons to change the date"
+            )
+            
+            # Update index if slider changed
+            if date_index != st.session_state.playback_index:
+                st.session_state.playback_index = date_index
+                st.rerun()
+                
+            st.write(f"**Current Date: {current_date}** (Day {st.session_state.playback_index + 1} of {total_dates})")
+    
+    with col3:
+        next_key = f"next_btn_{key_suffix}" if key_suffix else "next_btn"
+        next_clicked = st.button("▶", key=next_key, help="Next Date (Right Arrow)", on_click=None)
+        if next_clicked and st.session_state.playback_index < len(st.session_state.playback_dates) - 1:
+            st.session_state.playback_index += 1
+            st.rerun()
+    
+    # Add JavaScript for keyboard navigation
+    js_code = """
+    <script>
+    document.addEventListener('keydown', function(e) {
+        if (e.key === 'ArrowRight') {
+            // Find and click the next button
+            const nextBtn = document.querySelector('button:contains("▶")');
+            if (nextBtn) nextBtn.click();
+        } else if (e.key === 'ArrowLeft') {
+            // Find and click the previous button
+            const prevBtn = document.querySelector('button:contains("◀")');
+            if (prevBtn) prevBtn.click();
+        }
+    });
+    </script>
+    """
+    
+    st.components.v1.html(js_code, height=0)
+
 def main():
-    # Add custom CSS to make the map fill more space
+    # Add custom CSS for layout improvements
     st.markdown("""
         <style>
         .main > div {max-width: 100% !important;}
         .stApp {background-color: #0e1117;}
         .element-container {width: 100% !important;}
         .css-1d391kg {width: 100% !important;}
+        
+        /* Custom sidebar styles */
+        .cluster-sidebar {
+            background-color: #1E1E1E;
+            border-left: 1px solid #333;
+            padding: 15px;
+            position: fixed;
+            right: 0;
+            top: 0;
+            height: 100vh;
+            width: 400px;
+            overflow-y: auto;
+            transition: transform 0.3s ease-in-out;
+            z-index: 1000;
+        }
+        
+        .cluster-sidebar.hidden {
+            transform: translateX(400px);
+        }
+        
+        .sidebar-toggle {
+            position: fixed;
+            right: 410px;
+            top: 10px;
+            z-index: 1001;
+            background-color: #333;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            padding: 5px 10px;
+            cursor: pointer;
+        }
+        
+        .sidebar-toggle.hidden {
+            right: 10px;
+        }
         </style>
         """, unsafe_allow_html=True)
     
@@ -747,18 +1165,6 @@ def main():
     dataset = st.sidebar.selectbox(
         "Select Dataset",
         ['VIIRS_NOAA20_NRT', 'VIIRS_SNPP_NRT', 'MODIS_NRT']
-    )
-    
-    #Category selection
-    st.sidebar.subheader("Select Category")
-    category = st.sidebar.selectbox(
-      "Thermal Detection Type",
-      ["wildfires", "flares", "volcanoes"],
-      help="""
-        Wildfires: Temperature > 300K, FRP > 1.0 (VIIRS) or Confidence > 80% (MODIS)
-        Gas Flares: Temperature > 1000K, typically industrial sources
-        Volcanic Activity: Temperature > 1300K, clustered near known volcanic regions
-        """
     )
         
     selected_datasets = [dataset for dataset, is_selected in datasets.items() if is_selected]
@@ -864,7 +1270,7 @@ def main():
             results = handler.fetch_fire_data(
                 country=country,
                 dataset=dataset,
-                category='wildfires',
+                category=category,
                 use_clustering=True
             )
             # Store results in session state
@@ -874,129 +1280,202 @@ def main():
             # Reset playback mode
             st.session_state.playback_mode = False
     
-    # Display results in two columns
+    # Display results
     if st.session_state.results is not None and not st.session_state.results.empty:
-        col1, col2 = st.columns([3, 2])
+        # Get category display name for UI
+        category_display = get_category_display_name(category)
+        
+        # Main content area
+        col1 = st.container()
         
         with col1:
-            st.subheader("Fire Detection Map")
+            st.subheader("Detection Map")
             
             # Check if we're in playback mode
             if not st.session_state.playback_mode:
                 # Create the folium visualization (normal mode)
                 folium_map = plot_fire_detections_folium(
                     st.session_state.results, 
-                    f"Fire Clusters - {country}", 
-                    st.session_state.selected_cluster
+                    f"{category_display} Clusters - {country}", 
+                    st.session_state.selected_cluster,
+                    category=category
                 )
                 
                 if folium_map:
                     # Display the folium map - maintain aspect ratio
                     html_map = folium_map._repr_html_()
-                    components.html(html_map, height=600, width=985)
+                    components.html(html_map, height=550, width=985)
                     
                     # Add a map info section
                     with st.expander("Map Information"):
-                        st.write("""
-                        - **Points** represent fire detections from satellite data
-                        - **Colors** indicate temperature using the inferno color palette (yellow/white = hottest, purple/black = coolest)
-                        - **Highlighted points** (black outline) are from the selected cluster
+                        st.write(f"""
+                        - **Points** represent {category} detections from satellite data
+                        - **Colors** indicate temperature using the {color_palette} color palette (yellow/white = hottest, purple/black = coolest)
+                        - **Highlighted points** (black outline) are from the selected {category_display.lower()}
                         - **Popup information** displays when clicking on a point
                         - **Layer control** in the top right allows toggling different layers
                         - **Basemap options** can be changed using the layer control
-                        - **Coordinate data** is displayed in the table below when a cluster is selected
+                        - **Coordinate data** is displayed when a {category_display.lower()} is selected
                         """)
-                    
-                    # Display coordinate table for selected cluster
-                    display_coordinate_view(st.session_state.results)
                 else:
                     st.warning("No data to display on the map.")
             else:
                 # We're in playback mode - get current date
                 current_date = st.session_state.playback_dates[st.session_state.playback_index]
                 
-                # Add exit button for playback mode
-                if st.button("Exit Play Back"):
-                    st.session_state.playback_mode = False
-                    st.rerun()
-                
                 # Create the playback visualization
-                playback_title = f"Cluster {st.session_state.selected_cluster} - {current_date}"
-                
-                # Get only the data for the selected cluster and date
-                playback_data = st.session_state.results[
-                    (st.session_state.results['cluster'] == st.session_state.selected_cluster) &
-                    (st.session_state.results['acq_date'] == current_date)
-                ]
+                playback_title = f"{category_display} {st.session_state.selected_cluster} - {current_date}"
                 
                 folium_map = plot_fire_detections_folium(
-                    playback_data,
+                    st.session_state.results,
                     playback_title,
                     st.session_state.selected_cluster,
                     True,
-                    current_date
+                    current_date,
+                    category=category
                 )
                 
                 if folium_map:
                     # Save the map to an HTML string and display it using components
                     html_map = folium_map._repr_html_()
-                    components.html(html_map, height=600, width=700)
+                    components.html(html_map, height=550, width=985)
                     
-                    # Add the time slider (only if there are enough dates)
-                    if len(st.session_state.playback_dates) > 1:
-                        st.write("### Timeline")
+                    # Add exit button for playback mode
+                    if st.button("Exit Play Back"):
+                        st.session_state.playback_mode = False
+                        st.rerun()
+                        
+                    # Add the time slider and arrow navigation
+                    st.write("### Timeline")
+                    
+                    # Add arrow navigation with unique key
+                    create_arrow_navigation("playback_view")
+                    
+                    # Add the slider is now managed inside create_arrow_navigation
+                else:
+                    st.warning("No data to display for this date.")
+            
+            # If a cluster is selected, show feature graphs under the map (not in playback mode)
+            if st.session_state.selected_cluster is not None and not st.session_state.playback_mode:
+                # Display feature exploration directly under map
+                display_feature_exploration(st.session_state.results, st.session_state.selected_cluster, category)
+            
+            # Show coordinate data at the bottom for selected cluster
+            if st.session_state.selected_cluster is not None:
+                st.markdown("---")
+                if st.session_state.playback_mode:
+                    display_coordinate_view(st.session_state.results, st.session_state.playback_dates[st.session_state.playback_index])
+                else:
+                    display_coordinate_view(st.session_state.results)
+        
+        # Create a collapsible sidebar for cluster summary table
+        # Use HTML/JS for the custom sidebar
+        cluster_summary = create_cluster_summary(st.session_state.results, category)
+        
+        # Add JavaScript for toggling the sidebar
+        toggle_js = """
+        <script>
+        function toggleSidebar() {
+            const sidebar = document.querySelector('.cluster-sidebar');
+            const button = document.querySelector('.sidebar-toggle');
+            sidebar.classList.toggle('hidden');
+            button.classList.toggle('hidden');
+            if (sidebar.classList.contains('hidden')) {
+                button.innerHTML = '◀ Show {category} Table';
+            } else {
+                button.innerHTML = '▶ Hide';
+            }
+        }
+        </script>
+        """.replace("{category}", category_display)
+        
+        # Create HTML for the sidebar
+        sidebar_visible = st.session_state.sidebar_visible
+        sidebar_class = "" if sidebar_visible else "hidden"
+        button_class = "" if sidebar_visible else "hidden"
+        button_text = "▶ Hide" if sidebar_visible else f"◀ Show {category_display} Table"
+        
+        sidebar_html = f"""
+        <div class="cluster-sidebar {sidebar_class}" id="clusterSidebar">
+            <h3>{category_display} Summary</h3>
+            <div id="sidebar-content">
+                <!-- The table content will be inserted here by Streamlit -->
+            </div>
+        </div>
+        <button onclick="toggleSidebar()" class="sidebar-toggle {button_class}">{button_text}</button>
+        {toggle_js}
+        """
+        
+        # Add the sidebar HTML
+        st.components.v1.html(sidebar_html, height=0)
+        
+        # Create a container for the sidebar content
+        sidebar_container = st.container()
+        
+        # Create a timeline control area
+        if st.session_state.selected_cluster is not None:
+            # Create the timeline control UI
+            timeline_container = st.container()
+            
+            with timeline_container:
+                st.write("### Timeline")
+                
+                # Show playback timeline directly (no button needed)
+                if len(st.session_state.playback_dates) > 1:
+                    # Create columns for playback controls
+                    play_cols = st.columns([3, 1])
+                    
+                    with play_cols[0]:
+                        # Date slider
                         date_index = st.slider(
                             "Select Date", 
                             0, 
                             len(st.session_state.playback_dates) - 1, 
-                            st.session_state.playback_index
+                            st.session_state.playback_index,
+                            key="date_slider_summary",
+                            help="Slide to change the date and see how the cluster evolved over time"
                         )
                         
-                        # Update index if changed
+                        # Update playback index and mode if slider changed
                         if date_index != st.session_state.playback_index:
                             st.session_state.playback_index = date_index
+                            st.session_state.playback_mode = True
                             st.rerun()
-                    else:
-                        st.write("Not enough dates for playback.")
                     
-                    # Show current timeline info
-                    st.write(f"**Date: {current_date}** (Day {st.session_state.playback_index + 1} of {len(st.session_state.playback_dates)})")
-                    
-                    # Display statistics for this date
-                    st.write("### Daily Statistics")
-                    st.write(f"**Detection points:** {len(playback_data)}")
-                    if not playback_data.empty:
-                        st.write(f"**Mean FRP:** {playback_data['frp'].mean():.2f}")
-                        
-                        # Display temperature if available
-                        temp_col = get_temp_column(playback_data)
-                        if temp_col:
-                            st.write(f"**Mean Temperature:** {playback_data[temp_col].mean():.2f}K")
-                            st.write(f"**Max Temperature:** {playback_data[temp_col].max():.2f}K")
-                    
-                    # Display coordinate view for just this date
-                    display_coordinate_view(st.session_state.results, current_date)
+                    with play_cols[1]:
+                        # Toggle playback mode
+                        if st.session_state.playback_mode:
+                            if st.button("Exit Timeline", key="exit_timeline"):
+                                st.session_state.playback_mode = False
+                                st.rerun()
+                        else:
+                            if st.button("Start Timeline", key="start_timeline"):
+                                st.session_state.playback_mode = True
+                                st.rerun()
+                
+                    # Add arrow navigation if in playback mode
+                    if st.session_state.playback_mode:
+                        create_arrow_navigation()
                 else:
-                    st.warning("No data to display for this date.")
+                    st.info(f"This {category_display.lower()} only appears on one date. Timeline playback is not available.")
         
-        with col2:
-            st.subheader("Cluster Summary")
-            
-            # Create the cluster summary table
-            cluster_summary = create_cluster_summary(st.session_state.results)
+        # Sidebar content in a hidden div that will be moved to the sidebar by JS
+        with st.container():
+            # Hide this container visually but keep it in the DOM
+            st.markdown('<div id="hidden-sidebar-content" style="display:none">', unsafe_allow_html=True)
             
             if cluster_summary is not None:
                 # Allow user to select a cluster from the table
-                st.write("Select a cluster to highlight on the map:")
-                cluster_options = [f"Cluster {c}" for c in cluster_summary['cluster'].tolist()]
+                st.write(f"Select a {category_display.lower()} to highlight on the map:")
+                cluster_options = [f"{category_display} {c}" for c in cluster_summary['cluster'].tolist()]
                 selected_from_table = st.selectbox(
-                    "Select cluster",
+                    f"Select {category_display.lower()}",
                     ["None"] + cluster_options,
                     key="cluster_select"
                 )
                 
                 if selected_from_table != "None":
-                    cluster_id = int(selected_from_table.split(' ')[1])
+                    cluster_id = int(selected_from_table.split(' ')[-1])
                     
                     # Check if this is a new selection (different from current)
                     if st.session_state.selected_cluster != cluster_id:
@@ -1015,43 +1494,6 @@ def main():
                         
                         # Force a rerun to update the map with the new selection
                         st.rerun()
-                    
-                    # Show playback timeline directly (no button needed)
-                    if len(st.session_state.playback_dates) > 1:
-                        st.write("### Timeline")
-                        
-                        # Create columns for playback controls
-                        play_cols = st.columns([4, 1])
-                        
-                        with play_cols[0]:
-                            # Date slider
-                            date_index = st.slider(
-                                "Select Date", 
-                                0, 
-                                len(st.session_state.playback_dates) - 1, 
-                                st.session_state.playback_index,
-                                key="date_slider_direct",
-                                help="Slide to change the date and see how the fire cluster evolved over time"
-                            )
-                            
-                            # Update playback index and mode if slider changed
-                            if date_index != st.session_state.playback_index:
-                                st.session_state.playback_index = date_index
-                                st.session_state.playback_mode = True
-                                st.rerun()
-                        
-                        with play_cols[1]:
-                            # Toggle playback mode
-                            if st.session_state.playback_mode:
-                                if st.button("Exit Timeline", key="exit_timeline"):
-                                    st.session_state.playback_mode = False
-                                    st.rerun()
-                            else:
-                                if st.button("Start Timeline", key="start_timeline"):
-                                    st.session_state.playback_mode = True
-                                    st.rerun()
-                    else:
-                        st.info("This cluster only appears on one date. Timeline playback is not available.")
                 else:
                     # If "None" is selected, clear the selected cluster
                     if st.session_state.selected_cluster is not None:
@@ -1059,6 +1501,7 @@ def main():
                         # Force a rerun to update the map with all clusters shown
                         st.rerun()
                 
+                # Display the cluster table
                 # Highlight the selected cluster in the table if one is selected
                 if st.session_state.selected_cluster is not None:
                     highlight_func = lambda x: ['background-color: rgba(255, 220, 40, 0.6); color: black;' 
@@ -1069,7 +1512,7 @@ def main():
                         styled_summary,
                         column_config={
                             "cluster": "Cluster ID",
-                            "Number of Points": st.column_config.NumberColumn(help="Fire detections in cluster"),
+                            "Number of Points": st.column_config.NumberColumn(help=f"{category_display} detections in cluster"),
                             "Mean FRP": st.column_config.NumberColumn(format="%.2f"),
                             "Total FRP": st.column_config.NumberColumn(format="%.2f"),
                         },
@@ -1082,7 +1525,7 @@ def main():
                         cluster_summary,
                         column_config={
                             "cluster": "Cluster ID",
-                            "Number of Points": st.column_config.NumberColumn(help="Fire detections in cluster"),
+                            "Number of Points": st.column_config.NumberColumn(help=f"{category_display} detections in cluster"),
                             "Mean FRP": st.column_config.NumberColumn(format="%.2f"),
                             "Total FRP": st.column_config.NumberColumn(format="%.2f"),
                         },
@@ -1095,7 +1538,7 @@ def main():
                     cluster_data = cluster_summary[cluster_summary['cluster'] == st.session_state.selected_cluster].iloc[0]
                     
                     st.markdown("---")
-                    st.write(f"### Cluster {st.session_state.selected_cluster} Details")
+                    st.write(f"### {category_display} {st.session_state.selected_cluster} Details")
                     
                     # Create two columns for details
                     detail_col1, detail_col2 = st.columns(2)
@@ -1119,7 +1562,6 @@ def main():
                     Higher values suggest more intense burning.
                     """)
                     
-                    # Add temperature explanation if available
                     if 'Mean Temperature' in cluster_data:
                         st.info("""
                         **Temperature coloring**: 
@@ -1127,6 +1569,34 @@ def main():
                         - Orange/Red shows medium temperature
                         - Purple/Black indicates lower temperature
                         """)
+                        
+            # Close the hidden content div
+            st.markdown('</div>', unsafe_allow_html=True)
+            
+        # JavaScript to move sidebar content into the sidebar container
+        sidebar_js = """
+        <script>
+        // Function to move content to sidebar
+        function moveSidebarContent() {
+            const content = document.getElementById('hidden-sidebar-content');
+            const sidebar = document.getElementById('sidebar-content');
+            if (content && sidebar) {
+                sidebar.innerHTML = content.innerHTML;
+                content.style.display = 'none';
+            }
+        }
+        
+        // Execute after page is loaded
+        if (document.readyState === 'complete') {
+            moveSidebarContent();
+        } else {
+            window.addEventListener('load', moveSidebarContent);
+        }
+        </script>
+        """
+        
+        # Add the script to move content
+        st.components.v1.html(sidebar_js, height=0)
 
 if __name__ == "__main__":
     main()
