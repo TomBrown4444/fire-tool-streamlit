@@ -1292,29 +1292,6 @@ def plot_feature_time_series(df, cluster_id, features):
         st.warning(f"Error creating chart: {str(e)}")
         return None
         
-    melted_data = pd.melt(
-        chart_data, 
-        id_vars=['date'], 
-        var_name='Feature', 
-        value_name='Value'
-    )
-    
-    # One final check for infinite values
-    melted_data = melted_data[~np.isinf(melted_data['Value'])]
-    
-    # Create a single combined chart with all selected features
-    combined_chart = alt.Chart(melted_data).mark_line(point=True).encode(
-        x=alt.X('date:T', title='Date'),
-        y=alt.Y('Value:Q', title='Value', scale=alt.Scale(zero=False)),  # non-zero scale to better show changes
-        color=alt.Color('Feature:N', legend=alt.Legend(title='Feature')),
-        tooltip=['date:T', 'Value:Q', 'Feature:N']
-    ).properties(
-        title='Fire Evolution Over Time',
-        width=600,
-        height=300
-    ).interactive()
-    
-    return combined_chart, feature_info
 
 def display_feature_exploration(df, cluster_id, category, current_date=None):
     """Display feature exploration interface for the selected cluster"""
@@ -1360,15 +1337,19 @@ def display_feature_exploration(df, cluster_id, category, current_date=None):
     
     selected_features = []
     
+    playback_suffix = f"_playback_{current_date}" if current_date is not None else ""
+    frp_key = f"show_frp_{cluster_id}{playback_suffix}"
+    temp_key = f"show_temp_{cluster_id}{playback_suffix}"
+    
     with cols[0]:
         if 'frp' in available_features:
-            show_frp = st.checkbox("Fire Radiative Power", value=True, key="show_frp")
+            show_frp = st.checkbox("Fire Radiative Power", value=True, key=frp_key)
             if show_frp:
                 selected_features.append('frp')
     
     with cols[1]:
         if temp_col in available_features:
-            show_temp = st.checkbox("Brightness", value=False, key="show_temp")  # Default to off
+            show_temp = st.checkbox("Brightness", value=False, key=temp_key)
             if show_temp:
                 selected_features.append(temp_col)
     
@@ -1548,28 +1529,9 @@ def create_arrow_navigation(key_suffix=""):
     
     st.components.v1.html(js_code, height=0)
     
-def clear_stale_state():
-    """Clean up any stale state that might be causing issues"""
-    # Check for and clean up potentially problematic session state
-    if "processed_params" in st.session_state:
-        # Clean up old tracked parameters (older than 10 minutes)
-        current_time = time.time()
-        keys_to_remove = []
-        for key, timestamp in st.session_state.processed_params.items():
-            if current_time - timestamp > 600:  # 10 minutes
-                keys_to_remove.append(key)
-        
-        for key in keys_to_remove:
-            del st.session_state.processed_params[key]
-    
-    # Make sure URL parameters are clean
-    if 'selected_cluster' in st.query_params:
-        # If any query params were left over from a previous run,
-        # clear them for a fresh start
-        del st.query_params['selected_cluster']
 
 def handle_url_parameters(category=None):
-    """Handle URL parameters with category as a parameter"""
+    """Handle URL parameters with auto-playback mode for map selections"""
     # Check if selected_cluster parameter exists
     if 'selected_cluster' in st.query_params:
         try:
@@ -1596,8 +1558,8 @@ def handle_url_parameters(category=None):
                 st.session_state.playback_dates = unique_dates
                 st.session_state.playback_index = 0
                 
-                # Reset playback mode when selecting a new cluster
-                st.session_state.playback_mode = False
+                # Enable playback mode when selecting from map
+                st.session_state.playback_mode = True
                 
                 # Update cluster dropdown to match if it exists
                 if 'cluster_select' in st.session_state and 'cluster_options' in st.session_state:
@@ -1612,18 +1574,40 @@ def handle_url_parameters(category=None):
             if 'selected_cluster' in st.query_params:
                 del st.query_params['selected_cluster']
 
+
+# Other helper functions
+def clear_stale_state():
+    """Clean up any stale state that might be causing issues"""
+    # Check for and clean up potentially problematic session state
+    if "processed_params" in st.session_state:
+        # Clean up old tracked parameters (older than 10 minutes)
+        current_time = time.time()
+        keys_to_remove = []
+        for key, timestamp in st.session_state.processed_params.items():
+            if current_time - timestamp > 600:  # 10 minutes
+                keys_to_remove.append(key)
+        
+        for key in keys_to_remove:
+            del st.session_state.processed_params[key]
+    
+    # Make sure URL parameters are clean
+    if 'selected_cluster' in st.query_params:
+        # If any query params were left over from a previous run,
+        # clear them for a fresh start
+        del st.query_params['selected_cluster']
+                
 def main():
     # Clean up stale state
     clear_stale_state()
     
-    st.markdown("""
-    <style>
-    .main > div {max-width: 100% !important;}
-    .stApp {background-color: #0e1117;}
-    .element-container {width: 100% !important;}
-    /* Rest of your styles */
-    </style>
-    """, unsafe_allow_html=True)
+    cluster_id = None
+    if 'selected_cluster' in st.query_params:
+        try:
+            cluster_id = int(st.query_params['selected_cluster'])
+            del st.query_params['selected_cluster']
+        except (ValueError, TypeError):
+            if 'selected_cluster' in st.query_params:
+                del st.query_params['selected_cluster']
     
     # Create a two-column layout for the main interface
     main_cols = st.columns([1, 3])
@@ -1821,6 +1805,31 @@ def main():
             Raw Data: All data points including noise points not assigned to clusters
             """
         )
+        
+        if cluster_id is not None and 'results' in st.session_state and st.session_state.results is not None:
+            if st.session_state.get('selected_cluster') != cluster_id:
+                # This is from the map, so enable playback mode
+                st.session_state.selected_cluster = cluster_id
+                
+                # Get unique dates
+                cluster_points = st.session_state.results[st.session_state.results['cluster'] == cluster_id]
+                unique_dates = sorted(cluster_points['acq_date'].unique())
+                
+                # Store the dates
+                st.session_state.playback_dates = unique_dates
+                st.session_state.playback_index = 0
+                
+                # Enable playback mode for map selections
+                st.session_state.playback_mode = True
+                
+                # Update dropdown if it exists
+                if 'cluster_options' in st.session_state:
+                    cluster_name = f"{get_category_display_name(category)} {cluster_id}"
+                    if cluster_name in st.session_state['cluster_options']:
+                        st.session_state.cluster_select = cluster_name
+                
+                # Rerun
+                st.rerun()
         
         # Date range selection
         st.subheader("Select Date Range")
