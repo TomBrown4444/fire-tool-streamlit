@@ -429,32 +429,6 @@ class FIRMSHandler:
         return bboxes.get(country, None)
 
     def _apply_dbscan(self, df, eps=0.01, min_samples=5, bbox=None, max_time_diff_days=5):
-        
-        def _apply_dbscan(self, df, eps=0.01, min_samples=5, bbox=None, max_time_diff_days=5):
-            # Debug column names
-            st.write(f"Input columns: {df.columns.tolist()}")
-            
-            # Case-insensitive column name mapping
-            column_map = {col.lower(): col for col in df.columns}
-            
-            # Check for date column with various spellings/cases
-            date_col = None
-            for possible_name in ['acq_date', 'date', 'Date', 'ACQ_DATE']:
-                if possible_name in df.columns:
-                    date_col = possible_name
-                    break
-                elif possible_name.lower() in column_map:
-                    date_col = column_map[possible_name.lower()]
-                    break
-            
-            if date_col:
-                st.write(f"Found date column: '{date_col}'")
-                # Standardize the date column name
-                df['acq_date'] = df[date_col]
-            else:
-                st.warning("No date column found! Available columns: " + ", ".join(df.columns.tolist()))
-                
-        
         """Apply DBSCAN clustering with bbox filtering and time-based constraints
         
         Args:
@@ -465,7 +439,6 @@ class FIRMSHandler:
             max_time_diff_days (int): Maximum days between events to consider as same cluster
                                      Higher values will group events over longer time periods
         """
-        
         if 'Date' in df.columns and 'acq_date' not in df.columns:
                 df['acq_date'] = df['Date']
         elif 'date' in df.columns and 'acq_date' not in df.columns:
@@ -508,12 +481,6 @@ class FIRMSHandler:
                 # Convert acquisition date to datetime 
                 df['acq_date_dt'] = pd.to_datetime(df['acq_date'])
                 
-                cluster_days = df[df['cluster'] >= 0].groupby('cluster')['acq_date'].nunique()
-                multi_day_clusters = cluster_days[cluster_days > 1].index.tolist()
-                
-                if multi_day_clusters:
-                    st.success(f"Found {len(multi_day_clusters)} multi-day clusters during clustering: {multi_day_clusters}")
-                
                 # Create feature matrix with spatial and temporal components
                 coords = df[['latitude', 'longitude']].values
                 
@@ -522,7 +489,7 @@ class FIRMSHandler:
                 df['days_from_earliest'] = (df['acq_date_dt'] - earliest_date).dt.total_seconds() / (24 * 3600)
                 
                 # Scale the time component - higher weight = stricter time constraint
-                time_scaling = 0.1 / max_time_diff_days # Inverse of max days difference
+                time_scaling = 0.2 / max_time_diff_days # Inverse of max days difference
                 
                 # Create feature matrix with scaled time component
                 feature_matrix = np.column_stack([

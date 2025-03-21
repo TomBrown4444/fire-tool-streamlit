@@ -429,32 +429,6 @@ class FIRMSHandler:
         return bboxes.get(country, None)
 
     def _apply_dbscan(self, df, eps=0.01, min_samples=5, bbox=None, max_time_diff_days=5):
-        
-        def _apply_dbscan(self, df, eps=0.01, min_samples=5, bbox=None, max_time_diff_days=5):
-            # Debug column names
-            st.write(f"Input columns: {df.columns.tolist()}")
-            
-            # Case-insensitive column name mapping
-            column_map = {col.lower(): col for col in df.columns}
-            
-            # Check for date column with various spellings/cases
-            date_col = None
-            for possible_name in ['acq_date', 'date', 'Date', 'ACQ_DATE']:
-                if possible_name in df.columns:
-                    date_col = possible_name
-                    break
-                elif possible_name.lower() in column_map:
-                    date_col = column_map[possible_name.lower()]
-                    break
-            
-            if date_col:
-                st.write(f"Found date column: '{date_col}'")
-                # Standardize the date column name
-                df['acq_date'] = df[date_col]
-            else:
-                st.warning("No date column found! Available columns: " + ", ".join(df.columns.tolist()))
-                
-        
         """Apply DBSCAN clustering with bbox filtering and time-based constraints
         
         Args:
@@ -465,12 +439,6 @@ class FIRMSHandler:
             max_time_diff_days (int): Maximum days between events to consider as same cluster
                                      Higher values will group events over longer time periods
         """
-        
-        if 'Date' in df.columns and 'acq_date' not in df.columns:
-                df['acq_date'] = df['Date']
-        elif 'date' in df.columns and 'acq_date' not in df.columns:
-                df['acq_date'] = df['date']
-        
         if len(df) < min_samples:
             st.warning(f"Too few points ({len(df)}) for clustering. Minimum required: {min_samples}")
             return df
@@ -508,12 +476,6 @@ class FIRMSHandler:
                 # Convert acquisition date to datetime 
                 df['acq_date_dt'] = pd.to_datetime(df['acq_date'])
                 
-                cluster_days = df[df['cluster'] >= 0].groupby('cluster')['acq_date'].nunique()
-                multi_day_clusters = cluster_days[cluster_days > 1].index.tolist()
-                
-                if multi_day_clusters:
-                    st.success(f"Found {len(multi_day_clusters)} multi-day clusters during clustering: {multi_day_clusters}")
-                
                 # Create feature matrix with spatial and temporal components
                 coords = df[['latitude', 'longitude']].values
                 
@@ -522,7 +484,7 @@ class FIRMSHandler:
                 df['days_from_earliest'] = (df['acq_date_dt'] - earliest_date).dt.total_seconds() / (24 * 3600)
                 
                 # Scale the time component - higher weight = stricter time constraint
-                time_scaling = 0.1 / max_time_diff_days # Inverse of max days difference
+                time_scaling = 1.0 / max_time_diff_days  # Inverse of max days difference
                 
                 # Create feature matrix with scaled time component
                 feature_matrix = np.column_stack([
@@ -533,19 +495,6 @@ class FIRMSHandler:
                 # Apply DBSCAN to the combined spatial-temporal features
                 clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(feature_matrix)
                 df['cluster'] = clustering.labels_
-                
-                feature_ranges = np.ptp(feature_matrix, axis=0)  # Peak-to-peak range of each dimension
-                st.write(f"Feature matrix dimension ranges: Lat/Lon: {feature_ranges[0]:.4f}, {feature_ranges[1]:.4f}, Time: {feature_ranges[2]:.4f}")
-                st.write(f"Suggested eps (for reference): {np.mean(feature_ranges):.4f}")
-                
-                if len(df) > 10:  # Check if we have enough data points
-                    sample_points = df.sample(min(10, len(df))).copy()
-                    # Calculate time differences between sample points (in days)
-                    sample_points['time_diff'] = (sample_points['acq_date_dt'] - sample_points['acq_date_dt'].min()).dt.total_seconds() / (24 * 3600)
-                    st.write("Sample time differences (days):", sample_points['time_diff'].tolist())
-                    st.write("Time scaling factor:", time_scaling)
-                    # Show example feature matrix values
-                    st.write("Example feature matrix values (lat, lon, scaled_time):", feature_matrix[:3].tolist())
                 
                 # Clean up temporary columns
                 df = df.drop(columns=['days_from_earliest'])
@@ -1182,6 +1131,10 @@ def export_timeline(df, cluster_id=None, category="fires", playback_dates=None, 
         if len(playback_dates) <= 1:
             st.warning(f"The dataset only has data for one date. Timeline export requires data on multiple dates.")
             return
+            
+        # Create a progress container
+        export_progress = st.empty()
+        export_progress.info("Preparing timeline export for all clusters...")
         
         # Export all clusters timeline
         export_all_clusters_timeline(df, category, playback_dates, basemap_tiles, basemap)
@@ -2165,54 +2118,15 @@ def main():
                     category=category,
                     start_date=start_date,
                     end_date=end_date,
-                    use_clustering=use_clustering,
-                    eps=eps_val,
-                    min_samples=min_samples_val,
-                    chunk_days=7,
-                    max_time_diff_days=max_time_diff
+                    use_clustering=True,
+                    chunk_days=7
                 )
-                
-            # MULTI-DAY FILTERING CODE
-            if show_multiday_only and results is not None and not results.empty:
-                # Standardize column names for date (add this)
-                if 'Date' in results.columns and 'acq_date' not in results.columns:
-                    results['acq_date'] = results['Date']
-                elif 'date' in results.columns and 'acq_date' not in results.columns:
-                    results['acq_date'] = results['date']
-                # Debug information - before filtering
-                all_clusters = results[results['cluster'] >= 0]['cluster'].unique()
-                st.write(f"Found {len(all_clusters)} clusters before filtering")
-                
-                # Count days per cluster
-                cluster_days = results[results['cluster'] >= 0].groupby('cluster')['acq_date'].nunique()
-                
-                # More detailed information
-                for cluster_id, day_count in cluster_days.items():
-                    dates = sorted(results[results['cluster'] == cluster_id]['acq_date'].unique())
-                    date_range = f"{dates[0]} to {dates[-1]}" if len(dates) > 1 else dates[0]
-                    st.write(f"Cluster {cluster_id}: {day_count} days ({date_range})")
-                
-                # Get multi-day clusters
-                multiday_clusters = cluster_days[cluster_days > 1].index.tolist()
-                
-                # Filter results to keep only multi-day clusters
-                if multiday_clusters:
-                    multi_day_mask = results['cluster'].isin(multiday_clusters)
-                    filtered_results = results[multi_day_mask].copy()
-                    st.success(f"✓ Filtered to {len(multiday_clusters)} clusters that span multiple days")
-                    results = filtered_results
-                else:
-                    st.warning("⚠ No multi-day fire clusters found. Try adjusting clustering parameters or date range.")
-
-                if not multiday_clusters:
-                    st.warning("⚠ No multi-day fire clusters found. The clustering algorithm didn't find any fires spanning multiple days. Try increasing the 'Max Days Between Events' slider or adjust the 'Spatial Proximity' value.")
-            
-            # Store results in session state
-            st.session_state.results = results
-            # Reset selected cluster
-            st.session_state.selected_cluster = None
-            # Reset playback mode
-            st.session_state.playback_mode = False
+                # Store results in session state
+                st.session_state.results = results
+                # Reset selected cluster
+                st.session_state.selected_cluster = None
+                # Reset playback mode
+                st.session_state.playback_mode = False
                 
     with main_cols[1]:
         # Handle URL parameters
@@ -2225,7 +2139,7 @@ def main():
             
             st.subheader(f"Detection Map")
             
-            if st.button("Export Map", key="export_all_btn", use_container_width=True):
+            if st.button("Export All Clusters Timeline", key="export_all_btn", use_container_width=True):
                 # Define the basemap_tiles dictionary
                 basemap_tiles = {
                     'Dark': 'cartodbdark_matter',

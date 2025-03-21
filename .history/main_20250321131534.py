@@ -508,12 +508,6 @@ class FIRMSHandler:
                 # Convert acquisition date to datetime 
                 df['acq_date_dt'] = pd.to_datetime(df['acq_date'])
                 
-                cluster_days = df[df['cluster'] >= 0].groupby('cluster')['acq_date'].nunique()
-                multi_day_clusters = cluster_days[cluster_days > 1].index.tolist()
-                
-                if multi_day_clusters:
-                    st.success(f"Found {len(multi_day_clusters)} multi-day clusters during clustering: {multi_day_clusters}")
-                
                 # Create feature matrix with spatial and temporal components
                 coords = df[['latitude', 'longitude']].values
                 
@@ -522,7 +516,7 @@ class FIRMSHandler:
                 df['days_from_earliest'] = (df['acq_date_dt'] - earliest_date).dt.total_seconds() / (24 * 3600)
                 
                 # Scale the time component - higher weight = stricter time constraint
-                time_scaling = 0.1 / max_time_diff_days # Inverse of max days difference
+                time_scaling = 0.2 / max_time_diff_days # Inverse of max days difference
                 
                 # Create feature matrix with scaled time component
                 feature_matrix = np.column_stack([
