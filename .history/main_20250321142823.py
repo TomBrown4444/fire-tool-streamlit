@@ -966,8 +966,8 @@ def get_category_singular(category):
     else:
         return "cluster"  # Default for raw data
 
-def create_export_map(data, title, basemap_tiles, basemap, dot_color='#ff3300', border_color='white', border_width=1.5, fixed_zoom=7):
-    """Create a simplified map for export with static zoom and custom colors"""
+def create_export_map(data, title, basemap_tiles, basemap):
+    """Create a simplified map for export - more basic version to avoid iframe issues"""
     if data.empty:
         return None
     
@@ -979,69 +979,47 @@ def create_export_map(data, title, basemap_tiles, basemap, dot_color='#ff3300', 
         st.error(f"Cannot find coordinate columns in {data.columns.tolist()}")
         return None
     
-    # Calculate center point of data
-    center_lat = (data[lat_col].min() + data[lat_col].max()) / 2
-    center_lon = (data[lon_col].min() + data[lon_col].max()) / 2
+    # Calculate bounds
+    min_lat = data[lat_col].min()
+    max_lat = data[lat_col].max()
+    min_lon = data[lon_col].min() 
+    max_lon = data[lon_col].max()
     
-    # Get the appropriate tile URL based on basemap selection
-    tile_url = basemap_tiles.get(basemap, basemap_tiles['Dark'])
-    
-    # Create a map with fixed zoom and the selected basemap
+    # Create a simple map
     m = folium.Map(
-        location=[center_lat, center_lon],
-        zoom_start=fixed_zoom,  # Fixed zoom level
-        tiles=tile_url
+        location=[(min_lat + max_lat)/2, (min_lon + max_lon)/2],
+        zoom_start=6,
+        tiles='cartodbdark_matter',
+        width='100%',
+        height='100%'
     )
     
     # Add title
-    title_html = f'<h3 align="center" style="font-size:16px; color: white;"><b>{title}</b></h3>'
+    title_html = f'<h3 align="center" style="font-size:16px"><b>{title}</b></h3>'
     m.get_root().html.add_child(folium.Element(title_html))
     
-    # Add each point with custom colors
+    # Add each point explicitly
     for idx, row in data.iterrows():
         folium.CircleMarker(
             location=[row[lat_col], row[lon_col]],
-            radius=6,
-            color=border_color,         # Border color
-            weight=border_width,        # Border width
+            radius=5,
+            color='red',
             fill=True,
-            fill_color=dot_color,       # Fill color
-            fill_opacity=0.9
+            fill_color='#ff3300',
+            fill_opacity=0.8
         ).add_to(m)
+    
+    # Fit bounds
+    try:
+        m.fit_bounds([[min_lat, min_lon], [max_lat, max_lon]])
+    except:
+        pass
     
     # Return the HTML
     return m._repr_html_()
 
-def export_timeline(df, cluster_id=None, category="fires", playback_dates=None, basemap_tiles=None, basemap="Dark"):
-    """Create a timeline export as GIF or MP4
-    
-    Args:
-        df (pandas.DataFrame): DataFrame with fire data
-        cluster_id (int, optional): Specific cluster ID to export. If None, exports all clusters.
-        category (str): Category name (fires, flares, etc.)
-        playback_dates (list): List of dates to include in playback
-        basemap_tiles (dict): Dictionary mapping of basemap names to tile URLs
-        basemap (str): Selected basemap name
-    """
-    # Initialize basemap_tiles if not provided
-    if basemap_tiles is None:
-        basemap_tiles = {
-            'Dark': 'cartodbdark_matter',
-            'Light': 'cartodbpositron',
-            'Satellite': 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-            'Terrain': 'stamenterrain'
-        }
-    
-    # Filter for the selected cluster(s)
-    if cluster_id is not None:
-        # Export a single cluster
-        export_single_cluster_timeline(df, cluster_id, category, playback_dates, basemap_tiles, basemap)
-    else:
-        # Export all clusters (multi-cluster visualization)
-        export_all_clusters_timeline(df, category, playback_dates, basemap_tiles, basemap)
-
 def create_gif_from_frames(frames, fps=2):
-    """Create a GIF from HTML frames - without individual frame downloads"""
+    """Create a GIF from HTML frames - simplified version"""
     try:
         # Import required libraries
         from selenium import webdriver
@@ -1134,14 +1112,85 @@ def create_gif_from_frames(frames, fps=2):
         
         st.success("GIF created successfully!")
         
-        # Removed the individual frame download buttons
+        # Also save individual PNGs as a fallback
+        for i, img in enumerate(images):
+            img_buffer = BytesIO()
+            img.save(img_buffer, format='PNG')
+            img_buffer.seek(0)
+            st.download_button(
+                f"Download Frame {i+1}",
+                data=img_buffer,
+                file_name=f"frame_{i+1}.png",
+                mime="image/png",
+                key=f"frame_{i+1}"
+            )
         
         return gif_buffer.getvalue()
         
     except Exception as e:
         st.error(f"Error creating GIF: {str(e)}")
         return None
-
+     
+def export_timeline(df, cluster_id=None, category="fires", playback_dates=None, basemap_tiles=None, basemap="Dark"):
+    """Create a timeline export as GIF or MP4
+    
+    Args:
+        df (pandas.DataFrame): DataFrame with fire data
+        cluster_id (int, optional): Specific cluster ID to export. If None, exports all clusters.
+        category (str): Category name (fires, flares, etc.)
+        playback_dates (list): List of dates to include in playback
+        basemap_tiles (dict): Dictionary mapping of basemap names to tile URLs
+        basemap (str): Selected basemap name
+    """
+    # Initialize basemap_tiles if not provided
+    if basemap_tiles is None:
+        basemap_tiles = {
+            'Dark': 'cartodbdark_matter',
+            'Light': 'cartodbpositron',
+            'Satellite': 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+            'Terrain': 'stamenterrain'
+        }
+    
+    # Filter for the selected cluster(s)
+    if cluster_id is not None:
+        # Export a single cluster
+        cluster_data = df[df['cluster'] == cluster_id]
+        
+        # Check if we have valid timeline data to export
+        if cluster_data.empty:
+            st.warning(f"No data found for cluster {cluster_id}.")
+            return
+            
+        # Get dates for this cluster if not provided
+        if not playback_dates:
+            playback_dates = sorted(cluster_data['acq_date'].unique())
+            
+        if len(playback_dates) <= 1:
+            st.warning(f"This {get_category_singular(category)} only has data for one date. Timeline export requires data on multiple dates.")
+            return
+            
+        # Single cluster export
+        export_single_cluster_timeline(df, cluster_id, category, playback_dates, basemap_tiles, basemap)
+    else:
+        # Export all clusters (multi-cluster visualization)
+        # Filter out noise points
+        valid_clusters = df[df['cluster'] >= 0]
+        
+        if valid_clusters.empty:
+            st.warning("No valid clusters found to export.")
+            return
+            
+        # Get all dates in the dataset if not provided
+        if not playback_dates:
+            playback_dates = sorted(valid_clusters['acq_date'].unique())
+            
+        if len(playback_dates) <= 1:
+            st.warning(f"The dataset only has data for one date. Timeline export requires data on multiple dates.")
+            return
+        
+        # Export all clusters timeline
+        export_all_clusters_timeline(df, category, playback_dates, basemap_tiles, basemap)
+        
 def export_single_cluster_timeline(df, cluster_id, category, playback_dates, basemap_tiles, basemap):
     """Export timeline for a single cluster"""
     # Get data for the selected cluster
@@ -1164,22 +1213,6 @@ def export_single_cluster_timeline(df, cluster_id, category, playback_dates, bas
     frames = []
     total_dates = len(dates_with_data)
     
-    # Custom colors for fire visualization
-    dot_color = '#ff3300'  # Red-orange fill
-    border_color = 'white'
-    
-    # Find the bounds of all data to determine a fixed zoom level
-    all_lat = []
-    all_lon = []
-    
-    # Find coordinate columns
-    lat_col = next((col for col in ['latitude', 'Latitude', 'lat', 'Lat'] if col in cluster_data.columns), None)
-    lon_col = next((col for col in ['longitude', 'Longitude', 'lon', 'Lon'] if col in cluster_data.columns), None)
-    
-    if lat_col and lon_col:
-        all_lat = cluster_data[lat_col].tolist()
-        all_lon = cluster_data[lon_col].tolist()
-    
     for i, date in enumerate(sorted(dates_with_data)):
         status_text.write(f"Processing frame {i+1}/{total_dates}: {date}")
         progress_bar.progress((i+1)/total_dates)
@@ -1192,14 +1225,7 @@ def export_single_cluster_timeline(df, cluster_id, category, playback_dates, bas
         
         if not date_data.empty:
             # Create a simplified map for export
-            folium_map = create_export_map(
-                date_data, 
-                playback_title, 
-                basemap_tiles, 
-                basemap,
-                dot_color=dot_color,
-                border_color=border_color
-            )
+            folium_map = create_export_map(date_data, playback_title, basemap_tiles, basemap)
             frames.append(folium_map)
     
     status_text.write("Processing complete. Preparing download...")
@@ -1227,15 +1253,15 @@ def export_single_cluster_timeline(df, cluster_id, category, playback_dates, bas
         status_text.empty()
 
 def export_all_clusters_timeline(df, category, playback_dates, basemap_tiles, basemap):
-    """Export timeline showing all clusters over time, using the same approach as single cluster export"""
+    """Export timeline showing all clusters over time"""
     # Filter out noise points
     valid_data = df[df['cluster'] >= 0].copy()
     
-    if valid_data.empty:
-        st.warning("No valid clusters found to export.")
-        return
+    # Debug info
+    st.write(f"Exporting timeline with {len(valid_data)} points across {len(playback_dates)} dates")
+    st.write(f"Available columns: {valid_data.columns.tolist()}")
     
-    # Identify the correct date column 
+    # Identify the correct date column
     date_col = None
     for possible_name in ['acq_date', 'date', 'Date', 'ACQ_DATE']:
         if possible_name in valid_data.columns:
@@ -1243,74 +1269,38 @@ def export_all_clusters_timeline(df, category, playback_dates, basemap_tiles, ba
             break
     
     if not date_col:
-        st.error("❌ No date column found in data")
+        st.error("❌ Cannot export - no date column found in data")
         return
         
-    # Get all unique dates
-    dates_with_data = sorted(valid_data[date_col].unique())
+    st.write(f"Using date column: '{date_col}'")
     
-    # Check if we have at least 2 dates with data
-    if len(dates_with_data) <= 1:
-        st.warning(f"Data only spans one date. Timeline export requires data on multiple dates.")
-        return
-    
-    # Set up progress bar
+    # Set up progress tracking
     progress_bar = st.progress(0)
     status_text = st.empty()
     
     # Capture frames for each date
     frames = []
-    total_dates = len(dates_with_data)
+    total_dates = len(playback_dates)
     
-    # Custom colors for fire visualization
-    dot_color = '#ff3300'  # Red-orange fill
-    border_color = 'white'
-    
-    for i, date in enumerate(dates_with_data):
+    for i, date in enumerate(sorted(playback_dates)):
         status_text.write(f"Processing frame {i+1}/{total_dates}: {date}")
         progress_bar.progress((i+1)/total_dates)
         
         # Create map for this date
-        playback_title = f"All {get_category_display_name(category)}s - {date}"
+        playback_title = f"{get_category_display_name(category)}s - {date}"
         
-        # Filter data for this date across all clusters
+        # Filter data for this date across all clusters using the correct date column
         date_data = valid_data[valid_data[date_col] == date].copy()
         
+        # Debug info for this frame
+        st.write(f"Date {date}: Found {len(date_data)} points in {date_data['cluster'].nunique()} clusters")
+        
         if not date_data.empty:
-            # Create a simplified map for export using the selected basemap
-            folium_map = create_export_map(
-                date_data, 
-                playback_title, 
-                basemap_tiles, 
-                basemap,
-                dot_color=dot_color,
-                border_color=border_color
-            )
+            # Create a simplified map for export
+            folium_map = create_export_map(date_data, playback_title, basemap_tiles, basemap)
             frames.append(folium_map)
-    
-    status_text.write("Processing complete. Preparing download...")
-    
-    # Store frames in session state
-    st.session_state.frames = frames
-    
-    # Provide download option
-    if frames:
-        # Create download buffer
-        st.info(f"Timeline export ready for all clusters")
-        st.download_button(
-            label="Download as GIF",
-            data=create_gif_from_frames(frames),
-            file_name=f"{category}_all_clusters_timeline.gif",
-            mime="image/gif",
-            key="download_gif_all_btn",
-            use_container_width=True
-        )
-        progress_bar.empty()
-        status_text.empty()
-    else:
-        st.error("Failed to create timeline export - no frames were generated")
-        progress_bar.empty()
-        status_text.empty()
+        else:
+            st.warning(f"No data points found for date {date}") 
 
 def plot_fire_detections_folium(df, title="Fire Detections", selected_cluster=None, playback_mode=False, playback_date=None, dot_size_multiplier=1.0, color_palette='inferno', category="fires"):
     """Plot fire detections on a folium map with color palette based on temperature"""

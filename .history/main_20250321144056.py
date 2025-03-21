@@ -1012,34 +1012,6 @@ def create_export_map(data, title, basemap_tiles, basemap, dot_color='#ff3300', 
     # Return the HTML
     return m._repr_html_()
 
-def export_timeline(df, cluster_id=None, category="fires", playback_dates=None, basemap_tiles=None, basemap="Dark"):
-    """Create a timeline export as GIF or MP4
-    
-    Args:
-        df (pandas.DataFrame): DataFrame with fire data
-        cluster_id (int, optional): Specific cluster ID to export. If None, exports all clusters.
-        category (str): Category name (fires, flares, etc.)
-        playback_dates (list): List of dates to include in playback
-        basemap_tiles (dict): Dictionary mapping of basemap names to tile URLs
-        basemap (str): Selected basemap name
-    """
-    # Initialize basemap_tiles if not provided
-    if basemap_tiles is None:
-        basemap_tiles = {
-            'Dark': 'cartodbdark_matter',
-            'Light': 'cartodbpositron',
-            'Satellite': 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-            'Terrain': 'stamenterrain'
-        }
-    
-    # Filter for the selected cluster(s)
-    if cluster_id is not None:
-        # Export a single cluster
-        export_single_cluster_timeline(df, cluster_id, category, playback_dates, basemap_tiles, basemap)
-    else:
-        # Export all clusters (multi-cluster visualization)
-        export_all_clusters_timeline(df, category, playback_dates, basemap_tiles, basemap)
-
 def create_gif_from_frames(frames, fps=2):
     """Create a GIF from HTML frames - without individual frame downloads"""
     try:
