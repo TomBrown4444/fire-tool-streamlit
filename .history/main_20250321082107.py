@@ -1,4 +1,3 @@
-import sys
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -10,7 +9,7 @@ import re
 import time
 import os
 import tempfile
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta
 from io import StringIO, BytesIO
 import matplotlib.colors as mcolors
 from matplotlib.colors import LinearSegmentedColormap
@@ -428,17 +427,8 @@ class FIRMSHandler:
         }
         return bboxes.get(country, None)
 
-    def _apply_dbscan(self, df, eps=0.01, min_samples=5, bbox=None, max_time_diff_days=5):
-        """Apply DBSCAN clustering with bbox filtering and time-based constraints
-        
-        Args:
-            df (pandas.DataFrame): DataFrame with latitude and longitude columns
-            eps (float): DBSCAN eps parameter - spatial proximity threshold
-            min_samples (int): Minimum points to form a cluster
-            bbox (str): Bounding box string "min_lon,min_lat,max_lon,max_lat"
-            max_time_diff_days (int): Maximum days between events to consider as same cluster
-                                    Higher values will group events over longer time periods
-        """
+    def _apply_dbscan(self, df, eps=0.01, min_samples=5, bbox=None):
+        """Apply DBSCAN clustering with bbox filtering"""
         if len(df) < min_samples:
             st.warning(f"Too few points ({len(df)}) for clustering. Minimum required: {min_samples}")
             return df
@@ -470,50 +460,6 @@ class FIRMSHandler:
                 
                 df = filtered_df
         
-        # Time-based clustering - only if acq_date column exists
-        if 'acq_date' in df.columns:
-            try:
-                # Convert acquisition date to datetime 
-                df['acq_date_dt'] = pd.to_datetime(df['acq_date'])
-                
-                # Create feature matrix with spatial and temporal components
-                coords = df[['latitude', 'longitude']].values
-                
-                # Calculate days from earliest date for temporal component
-                earliest_date = df['acq_date_dt'].min()
-                df['days_from_earliest'] = (df['acq_date_dt'] - earliest_date).dt.total_seconds() / (24 * 3600)
-                
-                # Scale the time component - higher weight = stricter time constraint
-                time_scaling = 1.0 / max_time_diff_days  # Inverse of max days difference
-                
-                # Create feature matrix with scaled time component
-                feature_matrix = np.column_stack([
-                    coords,  # Latitude and longitude
-                    df['days_from_earliest'].values * time_scaling  # Scaled time component
-                ])
-                
-                # Apply DBSCAN to the combined spatial-temporal features
-                clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(feature_matrix)
-                df['cluster'] = clustering.labels_
-                
-                # Clean up temporary columns
-                df = df.drop(columns=['days_from_earliest'])
-                
-                # Regular clustering stats
-                n_clusters = len(set(clustering.labels_)) - (1 if -1 in clustering.labels_ else 0)
-                n_noise = list(clustering.labels_).count(-1)
-                
-                st.write(f"Number of clusters found: {n_clusters}")
-                st.write(f"Number of noise points: {n_noise}")
-                st.write(f"Points in clusters: {len(df) - n_noise}")
-                
-                return df
-                
-            except Exception as e:
-                st.warning(f"Error in time-based clustering: {str(e)}. Falling back to spatial-only clustering.")
-                # Fall through to standard clustering
-        
-        # Standard spatial-only clustering as fallback
         coords = df[['latitude', 'longitude']].values
         clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(coords)
         df['cluster'] = clustering.labels_
@@ -532,358 +478,66 @@ class FIRMSHandler:
         country=None, 
         bbox=None, 
         dataset='VIIRS_NOAA20_NRT', 
+        category='fires',
         start_date=None, 
         end_date=None,
-        category='fires',
         use_clustering=True,
         eps=0.01,
         min_samples=5,
-        chunk_days=7,  # Default chunk size
-        max_time_diff_days=5  # Maximum days gap to consider as same fire (default: 5 days)
+        chunk_days=7
     ):
-        """Fetch and process fire data from FIRMS API with support for historical data"""
-        
-        # Determine if we need historical data
-        today = datetime.now().date()
-        
-        # Convert dates to proper format for comparison
-        if isinstance(start_date, date):
-            start_date_date = start_date
-        elif isinstance(start_date, datetime):
-            start_date_date = start_date.date()
-        else:
-            # If it's a string, parse it
-            try:
-                start_date_date = datetime.strptime(str(start_date), "%Y-%m-%d").date()
-            except:
-                # Default to 7 days ago if parsing fails
-                start_date_date = today - timedelta(days=7)
-        
-        # Check if we need historical data (more than 10 days ago)
-        need_historical = (today - start_date_date).days > 10
-        
-        # If we need historical data, switch to Standard Processing dataset
-        original_dataset = dataset
-        if need_historical and "_NRT" in dataset:
-            # Switch to Standard Processing version
-            dataset = dataset.replace("_NRT", "_SP")
-            st.info(f"Fetching historical data using {dataset} dataset")
-        
-        # Dataset availability dates
-        dataset_availability = {
-            'MODIS_NRT': {'min_date': '2024-12-01', 'max_date': '2025-03-17'},
-            'MODIS_SP': {'min_date': '2000-11-01', 'max_date': '2024-11-30'},
-            'VIIRS_NOAA20_NRT': {'min_date': '2024-12-01', 'max_date': '2025-03-17'},
-            'VIIRS_NOAA20_SP': {'min_date': '2018-04-01', 'max_date': '2024-11-30'},
-            'VIIRS_NOAA21_NRT': {'min_date': '2024-01-17', 'max_date': '2025-03-17'},
-            'VIIRS_SNPP_NRT': {'min_date': '2025-01-01', 'max_date': '2025-03-17'},
-            'VIIRS_SNPP_SP': {'min_date': '2012-01-20', 'max_date': '2024-12-31'},
-            'LANDSAT_NRT': {'min_date': '2022-06-20', 'max_date': '2025-03-17'}
+        """Fetch and process fire data"""
+        dataset_start_dates = {
+            'MODIS_NRT': '2000-11-01',
+            'VIIRS_SNPP_NRT': '2012-01-19',
+            'VIIRS_NOAA20_NRT': '2018-01-01',
+            'VIIRS_NOAA21_NRT': '2023-01-01'
         }
         
-        if dataset not in dataset_availability:
-            st.error(f"Invalid dataset: {dataset}. Please select a valid dataset.")
+        if dataset not in dataset_start_dates:
+            st.error(f"Invalid dataset. Choose from: {list(dataset_start_dates.keys())}")
             return None
-        
-        # Check if the requested date range is available for this dataset
-        if dataset in dataset_availability:
-            min_date = datetime.strptime(dataset_availability[dataset]['min_date'], '%Y-%m-%d').date()
-            max_date = datetime.strptime(dataset_availability[dataset]['max_date'], '%Y-%m-%d').date()
-            
-            if start_date_date < min_date:
-                st.warning(f"Start date {start_date_date} is before the earliest available date ({min_date}) for {dataset}. Using earliest available date.")
-                start_date_date = min_date
-        
+
         if not bbox and country:
             bbox = self.get_country_bbox(country)
         
         if not bbox:
             st.error("Provide a country or bounding box")
             return None
-        
-        # Convert dates to strings
-        start_date_str = start_date_date.strftime('%Y-%m-%d')
-        
-        if isinstance(end_date, date):
-            end_date_date = end_date
-        elif isinstance(end_date, datetime):
-            end_date_date = end_date.date()
-        else:
-            # If it's a string, parse it
-            try:
-                end_date_date = datetime.strptime(str(end_date), "%Y-%m-%d").date()
-            except:
-                # Default to today if parsing fails
-                end_date_date = today
-        
-        # Ensure end date doesn't exceed dataset's max date
-        if dataset in dataset_availability:
-            max_date = datetime.strptime(dataset_availability[dataset]['max_date'], '%Y-%m-%d').date()
-            if end_date_date > max_date:
-                st.warning(f"End date {end_date_date} is after the latest available date ({max_date}) for {dataset}. Using latest available date.")
-                end_date_date = max_date
-        
-        end_date_str = end_date_date.strftime('%Y-%m-%d')
-        
-        # Now we need to fetch data in chunks, respecting the 10-day limit
-        st.write(f"Fetching fire data from {start_date_str} to {end_date_str} for {country}...")
-        
-        # Create date chunks of 10 days or less
-        date_chunks = []
-        current_date = start_date_date
-        while current_date <= end_date_date:
-            chunk_end = min(current_date + timedelta(days=min(10, chunk_days)-1), end_date_date)
-            date_chunks.append((current_date, chunk_end))
-            current_date = chunk_end + timedelta(days=1)
-        
-        # Set up progress tracking
-        st.write(f"Processing data in {len(date_chunks)} chunks...")
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        # Initialize combined results
-        all_results = pd.DataFrame()
-        
-        # Special handling for large countries
+
+        # Check if the country is large and show a message
         large_countries = ['United States', 'China', 'Russia', 'Canada', 'Brazil', 'Australia', 'India']
         if country in large_countries:
-            st.warning(f"⚠️ You selected a {(end_date_date - start_date_date).days} day period for {country}, which is a large country. This may take a long time to process.")
+            st.info(f"Fetching data for {country}, which may take longer due to the size of the country. Please be patient...")
             
-            # Special handling for Russia which is particularly large
-            if country == 'Russia':
-                st.info("Russia is very large. Dividing into smaller regions for better performance...")
-                
-                # Process western Russia
-                west_bbox = '19.25,41.151,60.0,81.2'
-                st.write("Processing Western Russia...")
-                for i, (chunk_start, chunk_end) in enumerate(date_chunks):
-                    chunk_start_str = chunk_start.strftime('%Y-%m-%d')
-                    chunk_end_str = chunk_end.strftime('%Y-%m-%d')
-                    status_text.write(f"Western Region - Chunk {i+1}/{len(date_chunks)}: {chunk_start_str} to {chunk_end_str}")
-                    progress_bar.progress((i) / (len(date_chunks) * 3))  # 3 regions
-                    
-                    days_in_chunk = (chunk_end - chunk_start).days + 1
-                    if need_historical:
-                        url = f"{self.base_url}{self.api_key}/{dataset}/{west_bbox}/{days_in_chunk}/{chunk_start_str}"
-                    else:
-                        url = f"{self.base_url}{self.api_key}/{dataset}/{west_bbox}/{days_in_chunk}/{chunk_start_str}"
-                    
-                    try:
-                        response = self.session.get(url, timeout=45)  # Shorter timeout
-                        response.raise_for_status()
-                        if response.text.strip() and "Invalid" not in response.text:
-                            chunk_df = pd.read_csv(StringIO(response.text))
-                            if not chunk_df.empty:
-                                date_mask = (chunk_df['acq_date'] >= chunk_start_str) & (chunk_df['acq_date'] <= chunk_end_str)
-                                filtered_chunk = chunk_df[date_mask].copy()
-                                if not filtered_chunk.empty:
-                                    all_results = pd.concat([all_results, filtered_chunk], ignore_index=True)
-                    except Exception as e:
-                        st.warning(f"Error processing Western Russia chunk {i+1}: {str(e)}")
-                
-                # Process central Russia
-                central_bbox = '60.0,41.151,120.0,81.2'
-                st.write("Processing Central Russia...")
-                for i, (chunk_start, chunk_end) in enumerate(date_chunks):
-                    chunk_start_str = chunk_start.strftime('%Y-%m-%d')
-                    chunk_end_str = chunk_end.strftime('%Y-%m-%d')
-                    status_text.write(f"Central Region - Chunk {i+1}/{len(date_chunks)}: {chunk_start_str} to {chunk_end_str}")
-                    progress_bar.progress((len(date_chunks) + i) / (len(date_chunks) * 3))
-                    
-                    days_in_chunk = (chunk_end - chunk_start).days + 1
-                    if need_historical:
-                        url = f"{self.base_url}{self.api_key}/{dataset}/{central_bbox}/{days_in_chunk}/{chunk_start_str}"
-                    else:
-                        url = f"{self.base_url}{self.api_key}/{dataset}/{central_bbox}/{days_in_chunk}/{chunk_start_str}"
-                    
-                    try:
-                        response = self.session.get(url, timeout=45)  # Shorter timeout
-                        response.raise_for_status()
-                        if response.text.strip() and "Invalid" not in response.text:
-                            chunk_df = pd.read_csv(StringIO(response.text))
-                            if not chunk_df.empty:
-                                date_mask = (chunk_df['acq_date'] >= chunk_start_str) & (chunk_df['acq_date'] <= chunk_end_str)
-                                filtered_chunk = chunk_df[date_mask].copy()
-                                if not filtered_chunk.empty:
-                                    all_results = pd.concat([all_results, filtered_chunk], ignore_index=True)
-                    except Exception as e:
-                        st.warning(f"Error processing Central Russia chunk {i+1}: {str(e)}")
-                
-                # Process eastern Russia
-                east_bbox = '120.0,41.151,180.0,81.2'
-                st.write("Processing Eastern Russia...")
-                for i, (chunk_start, chunk_end) in enumerate(date_chunks):
-                    chunk_start_str = chunk_start.strftime('%Y-%m-%d')
-                    chunk_end_str = chunk_end.strftime('%Y-%m-%d')
-                    status_text.write(f"Eastern Region - Chunk {i+1}/{len(date_chunks)}: {chunk_start_str} to {chunk_end_str}")
-                    progress_bar.progress((2 * len(date_chunks) + i) / (len(date_chunks) * 3))
-                    
-                    days_in_chunk = (chunk_end - chunk_start).days + 1
-                    if need_historical:
-                        url = f"{self.base_url}{self.api_key}/{dataset}/{east_bbox}/{days_in_chunk}/{chunk_start_str}"
-                    else:
-                        url = f"{self.base_url}{self.api_key}/{dataset}/{east_bbox}/{days_in_chunk}/{chunk_start_str}"
-                    
-                    try:
-                        response = self.session.get(url, timeout=45)  # Shorter timeout
-                        response.raise_for_status()
-                        if response.text.strip() and "Invalid" not in response.text:
-                            chunk_df = pd.read_csv(StringIO(response.text))
-                            if not chunk_df.empty:
-                                date_mask = (chunk_df['acq_date'] >= chunk_start_str) & (chunk_df['acq_date'] <= chunk_end_str)
-                                filtered_chunk = chunk_df[date_mask].copy()
-                                if not filtered_chunk.empty:
-                                    all_results = pd.concat([all_results, filtered_chunk], ignore_index=True)
-                    except Exception as e:
-                        st.warning(f"Error processing Eastern Russia chunk {i+1}: {str(e)}")
-            else:
-                # For other large countries, use standard approach with longer timeout
-                self.session.timeout = 120  # Increase timeout to 2 minutes
-                
-                # Standard chunked processing for other countries
-                for i, (chunk_start, chunk_end) in enumerate(date_chunks):
-                    chunk_start_str = chunk_start.strftime('%Y-%m-%d')
-                    chunk_end_str = chunk_end.strftime('%Y-%m-%d')
-                    
-                    # Update progress
-                    status_text.write(f"Fetching chunk {i+1}/{len(date_chunks)}: {chunk_start_str} to {chunk_end_str}")
-                    progress_bar.progress((i) / len(date_chunks))
-                    
-                    # Get the number of days in this chunk
-                    days_in_chunk = (chunk_end - chunk_start).days + 1
-                    
-                    # Format API URL based on historical data approach
-                    if need_historical:
-                        url = f"{self.base_url}{self.api_key}/{dataset}/{bbox}/{days_in_chunk}/{chunk_start_str}"
-                    else:
-                        if i == 0 and len(date_chunks) == 1 and days_in_chunk <= 7:
-                            url = f"{self.base_url}{self.api_key}/{original_dataset}/{bbox}/7"
-                        else:
-                            url = f"{self.base_url}{self.api_key}/{dataset}/{bbox}/{days_in_chunk}/{chunk_start_str}"
-                    
-                    try:
-                        # Fetch data for this chunk
-                        response = self.session.get(url, timeout=120)  # Longer timeout for large countries
-                        response.raise_for_status()
-                        
-                        # Parse CSV data if valid
-                        if response.text.strip() and "Invalid" not in response.text and "Error" not in response.text:
-                            chunk_df = pd.read_csv(StringIO(response.text))
-                            
-                            # Only process non-empty results
-                            if not chunk_df.empty:
-                                # Filter to ensure records are within the requested date range
-                                if 'acq_date' in chunk_df.columns:
-                                    date_mask = (chunk_df['acq_date'] >= chunk_start_str) & (chunk_df['acq_date'] <= chunk_end_str)
-                                    filtered_chunk = chunk_df[date_mask].copy()
-                                    if not filtered_chunk.empty:
-                                        all_results = pd.concat([all_results, filtered_chunk], ignore_index=True)
-                                else:
-                                    all_results = pd.concat([all_results, chunk_df], ignore_index=True)
-                    except Exception as e:
-                        st.warning(f"Error processing chunk {i+1}: {str(e)}")
-        else:
-            # Standard chunked processing for normal countries
-            for i, (chunk_start, chunk_end) in enumerate(date_chunks):
-                chunk_start_str = chunk_start.strftime('%Y-%m-%d')
-                chunk_end_str = chunk_end.strftime('%Y-%m-%d')
-                
-                # Update progress
-                status_text.write(f"Fetching chunk {i+1}/{len(date_chunks)}: {chunk_start_str} to {chunk_end_str}")
-                progress_bar.progress((i) / len(date_chunks))
-                
-                # Get the number of days in this chunk
-                days_in_chunk = (chunk_end - chunk_start).days + 1
-                
-                # Format API URL based on historical data approach
-                if need_historical:
-                    url = f"{self.base_url}{self.api_key}/{dataset}/{bbox}/{days_in_chunk}/{chunk_start_str}"
-                else:
-                    if i == 0 and len(date_chunks) == 1 and days_in_chunk <= 7:
-                        url = f"{self.base_url}{self.api_key}/{original_dataset}/{bbox}/7"
-                    else:
-                        url = f"{self.base_url}{self.api_key}/{dataset}/{bbox}/{days_in_chunk}/{chunk_start_str}"
-                
-                try:
-                    # Fetch data for this chunk
-                    response = self.session.get(url, timeout=60)
-                    response.raise_for_status()
-                    
-                    # Parse CSV data if valid
-                    if response.text.strip() and "Invalid" not in response.text and "Error" not in response.text:
-                        chunk_df = pd.read_csv(StringIO(response.text))
-                        
-                        # Only process non-empty results
-                        if not chunk_df.empty:
-                            # Filter to ensure records are within the requested date range
-                            if 'acq_date' in chunk_df.columns:
-                                date_mask = (chunk_df['acq_date'] >= chunk_start_str) & (chunk_df['acq_date'] <= chunk_end_str)
-                                filtered_chunk = chunk_df[date_mask].copy()
-                                if not filtered_chunk.empty:
-                                    all_results = pd.concat([all_results, filtered_chunk], ignore_index=True)
-                            else:
-                                all_results = pd.concat([all_results, chunk_df], ignore_index=True)
-                except Exception as e:
-                    st.warning(f"Error processing chunk {i+1}: {str(e)}")
+        url = f"{self.base_url}{self.api_key}/{dataset}/{bbox}/7"
         
-        # Clean up progress indicators
-        progress_bar.progress(1.0)
-        status_text.empty()
-        
-        # Check if we got any data
-        if all_results.empty:
-            st.warning(f"No records found for {category} in {country} for the selected date range")
-            return None
-        
-        st.success(f"Successfully fetched {len(all_results)} records from FIRMS API")
-        
-        # Apply bbox filtering to make sure points are within country boundaries
-        if bbox and not all_results.empty:
-            # Parse the bbox string to get coordinates
-            bbox_coords = [float(coord) for coord in bbox.split(',')]
-            if len(bbox_coords) == 4:  # min_lon, min_lat, max_lon, max_lat
-                min_lon, min_lat, max_lon, max_lat = bbox_coords
+        with st.spinner('Fetching data...'):
+            try:
+                response = self.session.get(url)
+                response.raise_for_status()
+                df = pd.read_csv(StringIO(response.text))
                 
-                # Filter dataframe to only include points within the bounding box
-                bbox_mask = (
-                    (all_results['longitude'] >= min_lon) & 
-                    (all_results['longitude'] <= max_lon) & 
-                    (all_results['latitude'] >= min_lat) & 
-                    (all_results['latitude'] <= max_lat)
-                )
+                st.write("Raw Data Information:")
+                st.write(f"Total records: {len(df)}")
                 
-                filtered_df = all_results[bbox_mask].copy()
-                st.info(f"Filtered data to {len(filtered_df)} points within the selected country boundaries.")
-                
-                if len(filtered_df) == 0:
-                    st.warning(f"No points found within the specified bounding box for {country}.")
+                if len(df) == 0:
+                    st.warning(f"No records found for {category} in {country}")
                     return None
                 
-                all_results = filtered_df
-
-            # Apply clustering to the results if needed
-            if use_clustering and not all_results.empty:
-                all_results = self._apply_dbscan(all_results, eps=eps, min_samples=min_samples, bbox=bbox, max_time_diff_days=max_time_diff_days)
-
-            # Apply spatial joins for specific categories
-            if category in ['flares', 'volcanoes'] and HAVE_GEO_DEPS and not all_results.empty:
-                with st.spinner(f'Performing spatial join with OSM {category} data...'):
-                    all_results = self.osm_handler.spatial_join(all_results, category, bbox)
-                    st.info(f"Spatial join completed. Found {len(all_results)} matching points.")
-                all_results = self.osm_handler.spatial_join(all_results, category, bbox)
+                if use_clustering:
+                    df = self._apply_dbscan(df, eps=eps, min_samples=min_samples, bbox=bbox)
                 
-                # If spatial join found no matches
-                if all_results.empty:
-                    # Create a container for the message
-                    message_container = st.empty()
-                    message_container.warning(f"No {category} found within the selected area and date range. Try a different location or category.")
-                    # Return None to prevent map creation
-                    return None
-                    
-        st.write("Raw Data Information:")
-        st.write(f"Total records: {len(all_results)}")
-        
-        return all_results
+                # Perform spatial join if needed for specified categories
+                if category in ['flares', 'volcanoes']:
+                    with st.spinner(f'Performing spatial join with OSM {category} data...'):
+                        df = self.osm_handler.spatial_join(df, category, bbox)
+                
+                return df
+
+            except Exception as e:
+                st.error(f"Error fetching data: {str(e)}")
+                return None
 
 def get_temp_column(df):
     """Determine which temperature column to use based on available data"""
@@ -1727,8 +1381,6 @@ def display_feature_exploration(df, cluster_id, category, current_date=None, cal
                 st.warning("Not enough time-series data to generate chart.")
     else:
         st.info("Please select at least one feature to visualize.")
-        
-
 
 def display_coordinate_view(df, playback_date=None):
     """Display a table with coordinates and details for the selected cluster"""
@@ -1956,8 +1608,6 @@ def main():
                 min_value=start_date,
                 max_value=today
             )
-            
-        
         
         # Calculate date range in days
         date_range_days = (end_date - start_date).days
@@ -1969,25 +1619,6 @@ def main():
         if country in large_countries and date_range_days > 14:
             st.warning(f"⚠️ You selected a {date_range_days}-day period for {country}, which is a large country. This may take a long time to process. Consider reducing your date range to 14 days or less for faster results.")
         
-        with st.expander("Advanced Clustering Settings"):
-            # Two-column layout for clustering parameters
-            clust_cols = st.columns(2)
-            
-            with clust_cols[0]:
-                eps_val = st.slider("Spatial Proximity (eps)", 0.005, 0.05, value=0.01, step=0.001, 
-                                    help="DBSCAN eps parameter. Higher values create larger clusters.")
-            
-            with clust_cols[1]:
-                min_samples_val = st.slider("Minimum Points", 3, 15, value=5, step=1,
-                                        help="Minimum points required to form a cluster.")
-                
-            use_clustering = st.checkbox("Use Clustering", value=True, 
-                                    help="Group nearby detections into clusters for easier analysis.")
-                                    
-            # Add time-based clustering parameter
-            max_time_diff = st.slider("Max Days Between Events (Same Cluster)", 1, 10, value=5, step=1,
-                                    help="Maximum days between fire events to be considered same cluster. Lower values create more temporally distinct clusters.")
-                
         # API credentials (hidden in expander)
         with st.expander("API Settings"):
             username = st.text_input("FIRMS Username", value="tombrown4444")
@@ -2176,20 +1807,12 @@ def main():
                         
                         with cols[1]:
                             if st.button("Export Timeline", key="export_timeline_btn", use_container_width=True):
-                                # Define the basemap_tiles dictionary if not defined globally
-                                basemap_tiles = {
-                                    'Dark': 'cartodbdark_matter',
-                                    'Light': 'cartodbpositron',
-                                    'Satellite': 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-                                    'Terrain': 'stamenterrain'
-                                }
-                                
                                 export_timeline(
                                     st.session_state.results, 
                                     st.session_state.selected_cluster,
                                     category,
                                     unique_dates,
-                                    basemap_tiles,                   # This parameter was missing
+                                    basemap_tiles,
                                     map_settings.get('basemap', 'Dark')
                                 )
                 

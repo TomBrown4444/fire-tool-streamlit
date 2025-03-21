@@ -1,4 +1,3 @@
-import sys
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -6,20 +5,23 @@ import matplotlib.pyplot as plt
 from sklearn.cluster import DBSCAN, OPTICS
 import hdbscan
 import requests
-import re
 import time
-import os
-import tempfile
-from datetime import datetime, timedelta, date
-from io import StringIO, BytesIO
+from datetime import datetime, timedelta
+from io import StringIO
 import matplotlib.colors as mcolors
 from matplotlib.colors import LinearSegmentedColormap
 import folium
-from folium.plugins import MarkerCluster, HeatMap, Fullscreen
+from folium.plugins import MarkerCluster, HeatMap
 from branca.colormap import LinearColormap
 import streamlit.components.v1 as components
 import altair as alt
 import json
+import requests
+import geopandas as gpd
+from shapely.geometry import Point, shape
+from geopy.distance import geodesic
+from folium.plugins import Fullscreen
+from folium.plugins import TimestampedGeoJson
 
 # Check if geospatial dependencies are available
 try:
@@ -118,6 +120,8 @@ class OSMHandler:
         );
         out center;
         """
+        
+        # Don't show this info
         
         # Try to query with retries
         for attempt in range(self.max_retries):
@@ -261,6 +265,277 @@ class OSMHandler:
             return filtered_df
         else:
             return result_df
+
+def fetch_fire_data(
+    self, 
+    country=None, 
+    bbox=None, 
+    dataset='VIIRS_NOAA20_NRT', 
+    start_date=None, 
+    end_date=None,
+    category='fires',
+    use_clustering=True,
+    eps=0.01,
+    min_samples=5
+):
+    """Fetch and process fire data"""
+    dataset_start_dates = {
+        'MODIS_NRT': '2000-11-01',
+        'VIIRS_SNPP_NRT': '2012-01-19',
+        'VIIRS_NOAA20_NRT': '2018-01-01',
+        'VIIRS_NOAA21_NRT': '2023-01-01'
+    }
+    
+    if dataset not in dataset_start_dates:
+        st.error(f"Invalid dataset. Choose from: {list(dataset_start_dates.keys())}")
+        return None
+
+    if not bbox and country:
+        bbox = self.get_country_bbox(country)
+    
+    if not bbox:
+        st.error("Provide a country or bounding box")
+        return None
+
+    # Check if the country is large and show a message
+    large_countries = ['United States', 'China', 'Russia', 'Canada', 'Brazil', 'Australia', 'India']
+    if country in large_countries:
+        st.info(f"Fetching data for {country}, which may take longer due to the size of the country. Please be patient...")
+        
+    url = f"{self.base_url}{self.api_key}/{dataset}/{bbox}/7"
+    
+    with st.spinner('Fetching data...'):
+        try:
+            response = self.session.get(url)
+            response.raise_for_status()
+            df = pd.read_csv(StringIO(response.text))
+            
+            st.write("Raw Data Information:")
+            st.write(f"Total records: {len(df)}")
+            
+            if len(df) == 0:
+                st.warning(f"No records found for {category} in {country}")
+                return None
+            
+            # First apply bbox filtering
+            if bbox:
+                # Parse the bbox string to get coordinates
+                bbox_coords = [float(coord) for coord in bbox.split(',')]
+                if len(bbox_coords) == 4:  # min_lon, min_lat, max_lon, max_lat
+                    min_lon, min_lat, max_lon, max_lat = bbox_coords
+                    
+                    # Filter dataframe to only include points within the bounding box
+                    bbox_mask = (
+                        (df['longitude'] >= min_lon) & 
+                        (df['longitude'] <= max_lon) & 
+                        (df['latitude'] >= min_lat) & 
+                        (df['latitude'] <= max_lat)
+                    )
+                    
+                    filtered_df = df[bbox_mask].copy()
+                    st.info(f"Filtered data to {len(filtered_df)} points within the selected country boundaries.")
+                    
+                    if len(filtered_df) == 0:
+                        st.warning(f"No points found within the specified bounding box for {country}.")
+                        return None
+                    
+                    df = filtered_df
+            
+            # Perform OSM spatial join if needed for flares or volcanoes
+            if category in ['flares', 'volcanoes'] and HAVE_GEO_DEPS:
+                original_count = len(df)
+                df = self.osm_handler.spatial_join(df, category, bbox)
+                
+                # If spatial join found no matches
+                if df.empty:
+                    # Create a container for the message
+                    message_container = st.empty()
+                    message_container.warning(f"No {category} found within the selected area and date range. Try a different location or category.")
+                    # Return None to prevent map creation
+                    return None
+
+        except Exception as e:
+            st.error(f"Error fetching data: {str(e)}")
+            return None
+
+def has_multiple_dates(df, cluster_id):
+    """Check if a cluster has data for multiple dates"""
+    if df is None or cluster_id is None:
+        return False
+    cluster_data = df[df['cluster'] == cluster_id]
+    unique_dates = cluster_data['acq_date'].unique()
+    return len(unique_dates) > 1
+
+def export_timeline(df, cluster_id, category, playback_dates, basemap_tiles, basemap):
+    """Create a timeline export as GIF or MP4"""
+    # Check if we have valid timeline data to export
+    if not playback_dates or len(playback_dates) <= 1 or cluster_id is None:
+        st.warning(f"No multi-date timeline data available to export. This {get_category_singular(category)} must appear on multiple dates for timeline export.")
+        return
+    
+    # Get data for the selected cluster
+    cluster_data = df[df['cluster'] == cluster_id]
+    
+    # Group by date and count points
+    date_counts = cluster_data.groupby('acq_date').size()
+    dates_with_data = list(date_counts.index)
+    
+    # Check if we have at least 2 dates with data
+    if len(dates_with_data) <= 1:
+        st.warning(f"This {get_category_singular(category)} only has data for one date. Timeline export requires data on multiple dates.")
+        return
+    
+    # Set up progress bar
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    # Capture frames for each date
+    frames = []
+    total_dates = len(dates_with_data)
+    
+    for i, date in enumerate(sorted(dates_with_data)):
+        status_text.write(f"Processing frame {i+1}/{total_dates}: {date}")
+        progress_bar.progress((i+1)/total_dates)
+        
+        # Create map for this date
+        playback_title = f"{get_category_display_name(category)} {cluster_id} - {date}"
+        
+        # Filter data for this date and cluster
+        date_data = df[(df['cluster'] == cluster_id) & (df['acq_date'] == date)].copy()
+        
+        if not date_data.empty:
+            # Create a simplified map for export
+            folium_map = create_export_map(date_data, playback_title, basemap_tiles, basemap)
+            frames.append(folium_map)
+    
+    status_text.write("Processing complete. Preparing download...")
+    
+    # Store frames in session state
+    st.session_state.frames = frames
+    
+    # Provide download option
+    if frames:
+        # Create download buffer
+        st.info("Timeline export ready for download")
+        st.download_button(
+            label="Download as GIF",
+            data=create_gif_from_frames(frames),
+            file_name=f"{category}_{cluster_id}_timeline.gif",
+            mime="image/gif",
+            use_container_width=True
+        )
+        progress_bar.empty()
+        status_text.empty()
+    else:
+        st.error("Failed to create timeline export - no frames were generated")
+        progress_bar.empty()
+        status_text.empty()
+        
+basemap_tiles = {
+    'Dark': 'cartodbdark_matter',
+    'Light': 'cartodbpositron',
+    'Satellite': 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+    'Terrain': 'stamenterrain'
+}
+
+def create_export_map(data, title, basemap_tiles, basemap):
+    """Create a simplified map for export"""
+    if data.empty:
+        return None
+    
+    # Calculate the bounding box
+    min_lat = data['latitude'].min()
+    max_lat = data['latitude'].max()
+    min_lon = data['longitude'].min()
+    max_lon = data['longitude'].max()
+    
+    # Create a map centered on the mean coordinates
+    center_lat = (min_lat + max_lat) / 2
+    center_lon = (min_lon + max_lon) / 2
+    
+    # Set the initial tiles based on basemap
+    initial_tiles = 'cartodbdark_matter'
+    if basemap in basemap_tiles:
+        initial_tiles = basemap_tiles[basemap]
+    
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=10, 
+                  tiles=initial_tiles)
+    
+    # Add the title
+    title_html = f'''
+             <h3 align="center" style="font-size:16px; color: white;"><b>{title}</b></h3>
+             '''
+    m.get_root().html.add_child(folium.Element(title_html))
+    
+    # Plot the points
+    for idx, point in data.iterrows():
+        folium.CircleMarker(
+            location=[point['latitude'], point['longitude']],
+            radius=6,
+            color='white',
+            weight=1.5,
+            fill=True,
+            fill_color='#ff3300',  # Red for visibility
+            fill_opacity=0.9
+        ).add_to(m)
+    
+    # Save to HTML string
+    html_string = m._repr_html_()
+    return html_string
+
+def create_gif_from_frames(frames):
+    """Create a GIF from HTML frames using a placeholder implementation"""
+    # This is a placeholder - in a real implementation, you would:
+    # 1. Render each HTML frame to an image
+    # 2. Use a library like PIL or imageio to create a GIF
+    # 3. Return the binary data of the GIF
+    
+    # For now, we'll just return a simple placeholder GIF
+    from io import BytesIO
+    from PIL import Image, ImageDraw, ImageFont
+    
+    frames_pil = []
+    for i in range(len(frames)):
+        # Create a placeholder image for each frame
+        img = Image.new('RGB', (800, 600), color=(30, 30, 30))
+        draw = ImageDraw.Draw(img)
+        draw.text((400, 300), f"Frame {i+1}/{len(frames)}", fill=(255, 255, 255))
+        frames_pil.append(img)
+    
+    # Save as GIF
+    gif_buffer = BytesIO()
+    frames_pil[0].save(
+        gif_buffer,
+        format='GIF',
+        append_images=frames_pil[1:],
+        save_all=True,
+        duration=500,  # 500ms per frame
+        loop=0  # Loop forever
+    )
+    gif_buffer.seek(0)
+    return gif_buffer.getvalue()
+
+def get_category_display_name(category):
+    """Return the display name for a category"""
+    if category == "fires":
+        return "Fire"
+    elif category == "flares":
+        return "Flare"
+    elif category == "volcanoes":
+        return "Volcano"
+    else:
+        return "Cluster"  # Default for raw data
+
+def get_category_singular(category):
+    """Return singular form of category name for UI purposes"""
+    if category == "fires":
+        return "fire"
+    elif category == "flares":
+        return "flare"
+    elif category == "volcanoes":
+        return "volcano"
+    else:
+        return "cluster"  # Default for raw data
 
 class FIRMSHandler:
     def __init__(self, username, password, api_key):
@@ -428,17 +703,8 @@ class FIRMSHandler:
         }
         return bboxes.get(country, None)
 
-    def _apply_dbscan(self, df, eps=0.01, min_samples=5, bbox=None, max_time_diff_days=5):
-        """Apply DBSCAN clustering with bbox filtering and time-based constraints
-        
-        Args:
-            df (pandas.DataFrame): DataFrame with latitude and longitude columns
-            eps (float): DBSCAN eps parameter - spatial proximity threshold
-            min_samples (int): Minimum points to form a cluster
-            bbox (str): Bounding box string "min_lon,min_lat,max_lon,max_lat"
-            max_time_diff_days (int): Maximum days between events to consider as same cluster
-                                    Higher values will group events over longer time periods
-        """
+    def _apply_dbscan(self, df, eps=0.01, min_samples=5, bbox=None):
+        """Apply DBSCAN clustering with bbox filtering"""
         if len(df) < min_samples:
             st.warning(f"Too few points ({len(df)}) for clustering. Minimum required: {min_samples}")
             return df
@@ -470,50 +736,6 @@ class FIRMSHandler:
                 
                 df = filtered_df
         
-        # Time-based clustering - only if acq_date column exists
-        if 'acq_date' in df.columns:
-            try:
-                # Convert acquisition date to datetime 
-                df['acq_date_dt'] = pd.to_datetime(df['acq_date'])
-                
-                # Create feature matrix with spatial and temporal components
-                coords = df[['latitude', 'longitude']].values
-                
-                # Calculate days from earliest date for temporal component
-                earliest_date = df['acq_date_dt'].min()
-                df['days_from_earliest'] = (df['acq_date_dt'] - earliest_date).dt.total_seconds() / (24 * 3600)
-                
-                # Scale the time component - higher weight = stricter time constraint
-                time_scaling = 1.0 / max_time_diff_days  # Inverse of max days difference
-                
-                # Create feature matrix with scaled time component
-                feature_matrix = np.column_stack([
-                    coords,  # Latitude and longitude
-                    df['days_from_earliest'].values * time_scaling  # Scaled time component
-                ])
-                
-                # Apply DBSCAN to the combined spatial-temporal features
-                clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(feature_matrix)
-                df['cluster'] = clustering.labels_
-                
-                # Clean up temporary columns
-                df = df.drop(columns=['days_from_earliest'])
-                
-                # Regular clustering stats
-                n_clusters = len(set(clustering.labels_)) - (1 if -1 in clustering.labels_ else 0)
-                n_noise = list(clustering.labels_).count(-1)
-                
-                st.write(f"Number of clusters found: {n_clusters}")
-                st.write(f"Number of noise points: {n_noise}")
-                st.write(f"Points in clusters: {len(df) - n_noise}")
-                
-                return df
-                
-            except Exception as e:
-                st.warning(f"Error in time-based clustering: {str(e)}. Falling back to spatial-only clustering.")
-                # Fall through to standard clustering
-        
-        # Standard spatial-only clustering as fallback
         coords = df[['latitude', 'longitude']].values
         clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(coords)
         df['cluster'] = clustering.labels_
@@ -537,353 +759,60 @@ class FIRMSHandler:
         category='fires',
         use_clustering=True,
         eps=0.01,
-        min_samples=5,
-        chunk_days=7,  # Default chunk size
-        max_time_diff_days=5  # Maximum days gap to consider as same fire (default: 5 days)
+        min_samples=5
     ):
-        """Fetch and process fire data from FIRMS API with support for historical data"""
-        
-        # Determine if we need historical data
-        today = datetime.now().date()
-        
-        # Convert dates to proper format for comparison
-        if isinstance(start_date, date):
-            start_date_date = start_date
-        elif isinstance(start_date, datetime):
-            start_date_date = start_date.date()
-        else:
-            # If it's a string, parse it
-            try:
-                start_date_date = datetime.strptime(str(start_date), "%Y-%m-%d").date()
-            except:
-                # Default to 7 days ago if parsing fails
-                start_date_date = today - timedelta(days=7)
-        
-        # Check if we need historical data (more than 10 days ago)
-        need_historical = (today - start_date_date).days > 10
-        
-        # If we need historical data, switch to Standard Processing dataset
-        original_dataset = dataset
-        if need_historical and "_NRT" in dataset:
-            # Switch to Standard Processing version
-            dataset = dataset.replace("_NRT", "_SP")
-            st.info(f"Fetching historical data using {dataset} dataset")
-        
-        # Dataset availability dates
-        dataset_availability = {
-            'MODIS_NRT': {'min_date': '2024-12-01', 'max_date': '2025-03-17'},
-            'MODIS_SP': {'min_date': '2000-11-01', 'max_date': '2024-11-30'},
-            'VIIRS_NOAA20_NRT': {'min_date': '2024-12-01', 'max_date': '2025-03-17'},
-            'VIIRS_NOAA20_SP': {'min_date': '2018-04-01', 'max_date': '2024-11-30'},
-            'VIIRS_NOAA21_NRT': {'min_date': '2024-01-17', 'max_date': '2025-03-17'},
-            'VIIRS_SNPP_NRT': {'min_date': '2025-01-01', 'max_date': '2025-03-17'},
-            'VIIRS_SNPP_SP': {'min_date': '2012-01-20', 'max_date': '2024-12-31'},
-            'LANDSAT_NRT': {'min_date': '2022-06-20', 'max_date': '2025-03-17'}
+        """Fetch and process fire data"""
+        dataset_start_dates = {
+            'MODIS_NRT': '2000-11-01',
+            'VIIRS_SNPP_NRT': '2012-01-19',
+            'VIIRS_NOAA20_NRT': '2018-01-01',
+            'VIIRS_NOAA21_NRT': '2023-01-01'
         }
         
-        if dataset not in dataset_availability:
-            st.error(f"Invalid dataset: {dataset}. Please select a valid dataset.")
+        if dataset not in dataset_start_dates:
+            st.error(f"Invalid dataset. Choose from: {list(dataset_start_dates.keys())}")
             return None
-        
-        # Check if the requested date range is available for this dataset
-        if dataset in dataset_availability:
-            min_date = datetime.strptime(dataset_availability[dataset]['min_date'], '%Y-%m-%d').date()
-            max_date = datetime.strptime(dataset_availability[dataset]['max_date'], '%Y-%m-%d').date()
-            
-            if start_date_date < min_date:
-                st.warning(f"Start date {start_date_date} is before the earliest available date ({min_date}) for {dataset}. Using earliest available date.")
-                start_date_date = min_date
-        
+
         if not bbox and country:
             bbox = self.get_country_bbox(country)
         
         if not bbox:
             st.error("Provide a country or bounding box")
             return None
-        
-        # Convert dates to strings
-        start_date_str = start_date_date.strftime('%Y-%m-%d')
-        
-        if isinstance(end_date, date):
-            end_date_date = end_date
-        elif isinstance(end_date, datetime):
-            end_date_date = end_date.date()
-        else:
-            # If it's a string, parse it
-            try:
-                end_date_date = datetime.strptime(str(end_date), "%Y-%m-%d").date()
-            except:
-                # Default to today if parsing fails
-                end_date_date = today
-        
-        # Ensure end date doesn't exceed dataset's max date
-        if dataset in dataset_availability:
-            max_date = datetime.strptime(dataset_availability[dataset]['max_date'], '%Y-%m-%d').date()
-            if end_date_date > max_date:
-                st.warning(f"End date {end_date_date} is after the latest available date ({max_date}) for {dataset}. Using latest available date.")
-                end_date_date = max_date
-        
-        end_date_str = end_date_date.strftime('%Y-%m-%d')
-        
-        # Now we need to fetch data in chunks, respecting the 10-day limit
-        st.write(f"Fetching fire data from {start_date_str} to {end_date_str} for {country}...")
-        
-        # Create date chunks of 10 days or less
-        date_chunks = []
-        current_date = start_date_date
-        while current_date <= end_date_date:
-            chunk_end = min(current_date + timedelta(days=min(10, chunk_days)-1), end_date_date)
-            date_chunks.append((current_date, chunk_end))
-            current_date = chunk_end + timedelta(days=1)
-        
-        # Set up progress tracking
-        st.write(f"Processing data in {len(date_chunks)} chunks...")
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        # Initialize combined results
-        all_results = pd.DataFrame()
-        
-        # Special handling for large countries
+
+        # Check if the country is large and show a message
         large_countries = ['United States', 'China', 'Russia', 'Canada', 'Brazil', 'Australia', 'India']
         if country in large_countries:
-            st.warning(f"⚠️ You selected a {(end_date_date - start_date_date).days} day period for {country}, which is a large country. This may take a long time to process.")
+            st.info(f"Fetching data for {country}, which may take longer due to the size of the country. Please be patient...")
             
-            # Special handling for Russia which is particularly large
-            if country == 'Russia':
-                st.info("Russia is very large. Dividing into smaller regions for better performance...")
-                
-                # Process western Russia
-                west_bbox = '19.25,41.151,60.0,81.2'
-                st.write("Processing Western Russia...")
-                for i, (chunk_start, chunk_end) in enumerate(date_chunks):
-                    chunk_start_str = chunk_start.strftime('%Y-%m-%d')
-                    chunk_end_str = chunk_end.strftime('%Y-%m-%d')
-                    status_text.write(f"Western Region - Chunk {i+1}/{len(date_chunks)}: {chunk_start_str} to {chunk_end_str}")
-                    progress_bar.progress((i) / (len(date_chunks) * 3))  # 3 regions
-                    
-                    days_in_chunk = (chunk_end - chunk_start).days + 1
-                    if need_historical:
-                        url = f"{self.base_url}{self.api_key}/{dataset}/{west_bbox}/{days_in_chunk}/{chunk_start_str}"
-                    else:
-                        url = f"{self.base_url}{self.api_key}/{dataset}/{west_bbox}/{days_in_chunk}/{chunk_start_str}"
-                    
-                    try:
-                        response = self.session.get(url, timeout=45)  # Shorter timeout
-                        response.raise_for_status()
-                        if response.text.strip() and "Invalid" not in response.text:
-                            chunk_df = pd.read_csv(StringIO(response.text))
-                            if not chunk_df.empty:
-                                date_mask = (chunk_df['acq_date'] >= chunk_start_str) & (chunk_df['acq_date'] <= chunk_end_str)
-                                filtered_chunk = chunk_df[date_mask].copy()
-                                if not filtered_chunk.empty:
-                                    all_results = pd.concat([all_results, filtered_chunk], ignore_index=True)
-                    except Exception as e:
-                        st.warning(f"Error processing Western Russia chunk {i+1}: {str(e)}")
-                
-                # Process central Russia
-                central_bbox = '60.0,41.151,120.0,81.2'
-                st.write("Processing Central Russia...")
-                for i, (chunk_start, chunk_end) in enumerate(date_chunks):
-                    chunk_start_str = chunk_start.strftime('%Y-%m-%d')
-                    chunk_end_str = chunk_end.strftime('%Y-%m-%d')
-                    status_text.write(f"Central Region - Chunk {i+1}/{len(date_chunks)}: {chunk_start_str} to {chunk_end_str}")
-                    progress_bar.progress((len(date_chunks) + i) / (len(date_chunks) * 3))
-                    
-                    days_in_chunk = (chunk_end - chunk_start).days + 1
-                    if need_historical:
-                        url = f"{self.base_url}{self.api_key}/{dataset}/{central_bbox}/{days_in_chunk}/{chunk_start_str}"
-                    else:
-                        url = f"{self.base_url}{self.api_key}/{dataset}/{central_bbox}/{days_in_chunk}/{chunk_start_str}"
-                    
-                    try:
-                        response = self.session.get(url, timeout=45)  # Shorter timeout
-                        response.raise_for_status()
-                        if response.text.strip() and "Invalid" not in response.text:
-                            chunk_df = pd.read_csv(StringIO(response.text))
-                            if not chunk_df.empty:
-                                date_mask = (chunk_df['acq_date'] >= chunk_start_str) & (chunk_df['acq_date'] <= chunk_end_str)
-                                filtered_chunk = chunk_df[date_mask].copy()
-                                if not filtered_chunk.empty:
-                                    all_results = pd.concat([all_results, filtered_chunk], ignore_index=True)
-                    except Exception as e:
-                        st.warning(f"Error processing Central Russia chunk {i+1}: {str(e)}")
-                
-                # Process eastern Russia
-                east_bbox = '120.0,41.151,180.0,81.2'
-                st.write("Processing Eastern Russia...")
-                for i, (chunk_start, chunk_end) in enumerate(date_chunks):
-                    chunk_start_str = chunk_start.strftime('%Y-%m-%d')
-                    chunk_end_str = chunk_end.strftime('%Y-%m-%d')
-                    status_text.write(f"Eastern Region - Chunk {i+1}/{len(date_chunks)}: {chunk_start_str} to {chunk_end_str}")
-                    progress_bar.progress((2 * len(date_chunks) + i) / (len(date_chunks) * 3))
-                    
-                    days_in_chunk = (chunk_end - chunk_start).days + 1
-                    if need_historical:
-                        url = f"{self.base_url}{self.api_key}/{dataset}/{east_bbox}/{days_in_chunk}/{chunk_start_str}"
-                    else:
-                        url = f"{self.base_url}{self.api_key}/{dataset}/{east_bbox}/{days_in_chunk}/{chunk_start_str}"
-                    
-                    try:
-                        response = self.session.get(url, timeout=45)  # Shorter timeout
-                        response.raise_for_status()
-                        if response.text.strip() and "Invalid" not in response.text:
-                            chunk_df = pd.read_csv(StringIO(response.text))
-                            if not chunk_df.empty:
-                                date_mask = (chunk_df['acq_date'] >= chunk_start_str) & (chunk_df['acq_date'] <= chunk_end_str)
-                                filtered_chunk = chunk_df[date_mask].copy()
-                                if not filtered_chunk.empty:
-                                    all_results = pd.concat([all_results, filtered_chunk], ignore_index=True)
-                    except Exception as e:
-                        st.warning(f"Error processing Eastern Russia chunk {i+1}: {str(e)}")
-            else:
-                # For other large countries, use standard approach with longer timeout
-                self.session.timeout = 120  # Increase timeout to 2 minutes
-                
-                # Standard chunked processing for other countries
-                for i, (chunk_start, chunk_end) in enumerate(date_chunks):
-                    chunk_start_str = chunk_start.strftime('%Y-%m-%d')
-                    chunk_end_str = chunk_end.strftime('%Y-%m-%d')
-                    
-                    # Update progress
-                    status_text.write(f"Fetching chunk {i+1}/{len(date_chunks)}: {chunk_start_str} to {chunk_end_str}")
-                    progress_bar.progress((i) / len(date_chunks))
-                    
-                    # Get the number of days in this chunk
-                    days_in_chunk = (chunk_end - chunk_start).days + 1
-                    
-                    # Format API URL based on historical data approach
-                    if need_historical:
-                        url = f"{self.base_url}{self.api_key}/{dataset}/{bbox}/{days_in_chunk}/{chunk_start_str}"
-                    else:
-                        if i == 0 and len(date_chunks) == 1 and days_in_chunk <= 7:
-                            url = f"{self.base_url}{self.api_key}/{original_dataset}/{bbox}/7"
-                        else:
-                            url = f"{self.base_url}{self.api_key}/{dataset}/{bbox}/{days_in_chunk}/{chunk_start_str}"
-                    
-                    try:
-                        # Fetch data for this chunk
-                        response = self.session.get(url, timeout=120)  # Longer timeout for large countries
-                        response.raise_for_status()
-                        
-                        # Parse CSV data if valid
-                        if response.text.strip() and "Invalid" not in response.text and "Error" not in response.text:
-                            chunk_df = pd.read_csv(StringIO(response.text))
-                            
-                            # Only process non-empty results
-                            if not chunk_df.empty:
-                                # Filter to ensure records are within the requested date range
-                                if 'acq_date' in chunk_df.columns:
-                                    date_mask = (chunk_df['acq_date'] >= chunk_start_str) & (chunk_df['acq_date'] <= chunk_end_str)
-                                    filtered_chunk = chunk_df[date_mask].copy()
-                                    if not filtered_chunk.empty:
-                                        all_results = pd.concat([all_results, filtered_chunk], ignore_index=True)
-                                else:
-                                    all_results = pd.concat([all_results, chunk_df], ignore_index=True)
-                    except Exception as e:
-                        st.warning(f"Error processing chunk {i+1}: {str(e)}")
-        else:
-            # Standard chunked processing for normal countries
-            for i, (chunk_start, chunk_end) in enumerate(date_chunks):
-                chunk_start_str = chunk_start.strftime('%Y-%m-%d')
-                chunk_end_str = chunk_end.strftime('%Y-%m-%d')
-                
-                # Update progress
-                status_text.write(f"Fetching chunk {i+1}/{len(date_chunks)}: {chunk_start_str} to {chunk_end_str}")
-                progress_bar.progress((i) / len(date_chunks))
-                
-                # Get the number of days in this chunk
-                days_in_chunk = (chunk_end - chunk_start).days + 1
-                
-                # Format API URL based on historical data approach
-                if need_historical:
-                    url = f"{self.base_url}{self.api_key}/{dataset}/{bbox}/{days_in_chunk}/{chunk_start_str}"
-                else:
-                    if i == 0 and len(date_chunks) == 1 and days_in_chunk <= 7:
-                        url = f"{self.base_url}{self.api_key}/{original_dataset}/{bbox}/7"
-                    else:
-                        url = f"{self.base_url}{self.api_key}/{dataset}/{bbox}/{days_in_chunk}/{chunk_start_str}"
-                
-                try:
-                    # Fetch data for this chunk
-                    response = self.session.get(url, timeout=60)
-                    response.raise_for_status()
-                    
-                    # Parse CSV data if valid
-                    if response.text.strip() and "Invalid" not in response.text and "Error" not in response.text:
-                        chunk_df = pd.read_csv(StringIO(response.text))
-                        
-                        # Only process non-empty results
-                        if not chunk_df.empty:
-                            # Filter to ensure records are within the requested date range
-                            if 'acq_date' in chunk_df.columns:
-                                date_mask = (chunk_df['acq_date'] >= chunk_start_str) & (chunk_df['acq_date'] <= chunk_end_str)
-                                filtered_chunk = chunk_df[date_mask].copy()
-                                if not filtered_chunk.empty:
-                                    all_results = pd.concat([all_results, filtered_chunk], ignore_index=True)
-                            else:
-                                all_results = pd.concat([all_results, chunk_df], ignore_index=True)
-                except Exception as e:
-                    st.warning(f"Error processing chunk {i+1}: {str(e)}")
+        url = f"{self.base_url}{self.api_key}/{dataset}/{bbox}/7"
         
-        # Clean up progress indicators
-        progress_bar.progress(1.0)
-        status_text.empty()
-        
-        # Check if we got any data
-        if all_results.empty:
-            st.warning(f"No records found for {category} in {country} for the selected date range")
-            return None
-        
-        st.success(f"Successfully fetched {len(all_results)} records from FIRMS API")
-        
-        # Apply bbox filtering to make sure points are within country boundaries
-        if bbox and not all_results.empty:
-            # Parse the bbox string to get coordinates
-            bbox_coords = [float(coord) for coord in bbox.split(',')]
-            if len(bbox_coords) == 4:  # min_lon, min_lat, max_lon, max_lat
-                min_lon, min_lat, max_lon, max_lat = bbox_coords
+        with st.spinner('Fetching data...'):
+            try:
+                response = self.session.get(url)
+                response.raise_for_status()
+                df = pd.read_csv(StringIO(response.text))
                 
-                # Filter dataframe to only include points within the bounding box
-                bbox_mask = (
-                    (all_results['longitude'] >= min_lon) & 
-                    (all_results['longitude'] <= max_lon) & 
-                    (all_results['latitude'] >= min_lat) & 
-                    (all_results['latitude'] <= max_lat)
-                )
+                st.write("Raw Data Information:")
+                st.write(f"Total records: {len(df)}")
                 
-                filtered_df = all_results[bbox_mask].copy()
-                st.info(f"Filtered data to {len(filtered_df)} points within the selected country boundaries.")
-                
-                if len(filtered_df) == 0:
-                    st.warning(f"No points found within the specified bounding box for {country}.")
+                if len(df) == 0:
+                    st.warning(f"No records found for {category} in {country}")
                     return None
                 
-                all_results = filtered_df
-
-            # Apply clustering to the results if needed
-            if use_clustering and not all_results.empty:
-                all_results = self._apply_dbscan(all_results, eps=eps, min_samples=min_samples, bbox=bbox, max_time_diff_days=max_time_diff_days)
-
-            # Apply spatial joins for specific categories
-            if category in ['flares', 'volcanoes'] and HAVE_GEO_DEPS and not all_results.empty:
-                with st.spinner(f'Performing spatial join with OSM {category} data...'):
-                    all_results = self.osm_handler.spatial_join(all_results, category, bbox)
-                    st.info(f"Spatial join completed. Found {len(all_results)} matching points.")
-                all_results = self.osm_handler.spatial_join(all_results, category, bbox)
+                if use_clustering:
+                    df = self._apply_dbscan(df, eps=eps, min_samples=min_samples, bbox=bbox)
                 
-                # If spatial join found no matches
-                if all_results.empty:
-                    # Create a container for the message
-                    message_container = st.empty()
-                    message_container.warning(f"No {category} found within the selected area and date range. Try a different location or category.")
-                    # Return None to prevent map creation
-                    return None
-                    
-        st.write("Raw Data Information:")
-        st.write(f"Total records: {len(all_results)}")
-        
-        return all_results
+                # Perform spatial join if needed for specified categories
+                if category in ['flares', 'volcanoes']:
+                    with st.spinner(f'Performing spatial join with OSM {category} data...'):
+                        df = self.osm_handler.spatial_join(df, category, bbox)
+                
+                return df
+
+            except Exception as e:
+                st.error(f"Error fetching data: {str(e)}")
+                return None
 
 def get_temp_column(df):
     """Determine which temperature column to use based on available data"""
@@ -894,255 +823,7 @@ def get_temp_column(df):
     else:
         return None
 
-def get_category_display_name(category):
-    """Return the display name for a category"""
-    if category == "fires":
-        return "Fire"
-    elif category == "flares":
-        return "Flare"
-    elif category == "volcanoes":
-        return "Volcano"
-    else:
-        return "Cluster"  # Default for raw data
-
-def get_category_singular(category):
-    """Return singular form of category name for UI purposes"""
-    if category == "fires":
-        return "fire"
-    elif category == "flares":
-        return "flare"
-    elif category == "volcanoes":
-        return "volcano"
-    else:
-        return "cluster"  # Default for raw data
-
-def create_export_map(data, title, basemap_tiles, basemap):
-    """Create a simplified map for export"""
-    if data.empty:
-        return None
-    
-    # Calculate the bounding box
-    min_lat = data['latitude'].min()
-    max_lat = data['latitude'].max()
-    min_lon = data['longitude'].min()
-    max_lon = data['longitude'].max()
-    
-    # Create a map centered on the mean coordinates
-    center_lat = (min_lat + max_lat) / 2
-    center_lon = (min_lon + max_lon) / 2
-    
-    # Set the initial tiles based on basemap
-    initial_tiles = 'cartodbdark_matter'
-    if basemap in basemap_tiles:
-        initial_tiles = basemap_tiles[basemap]
-    
-    m = folium.Map(location=[center_lat, center_lon], zoom_start=10, 
-                  tiles=initial_tiles)
-    
-    # Add the title
-    title_html = f'''
-             <h3 align="center" style="font-size:16px; color: white;"><b>{title}</b></h3>
-             '''
-    m.get_root().html.add_child(folium.Element(title_html))
-    
-    # Plot the points
-    for idx, point in data.iterrows():
-        folium.CircleMarker(
-            location=[point['latitude'], point['longitude']],
-            radius=6,
-            color='white',
-            weight=1.5,
-            fill=True,
-            fill_color='#ff3300',  # Red for visibility
-            fill_opacity=0.9
-        ).add_to(m)
-    
-    # Save to HTML string
-    html_string = m._repr_html_()
-    return html_string
-
-def create_gif_from_frames(frames, fps=2):
-    """Create a GIF from HTML frames using selenium and PIL"""
-    # Import required libraries for GIF creation
-    try:
-        from selenium import webdriver
-        from selenium.webdriver.chrome.options import Options
-        from selenium.webdriver.chrome.service import Service
-        from webdriver_manager.chrome import ChromeDriverManager
-        from PIL import Image
-    except ImportError:
-        st.error("Required libraries not installed. Please install: selenium, webdriver-manager, Pillow")
-        return None
-    
-    # Create a temporary directory to save HTML files
-    temp_dir = tempfile.mkdtemp()
-    frame_paths = []
-    screenshot_paths = []
-    
-    try:
-        # Set up headless Chrome
-        chrome_options = Options()
-        chrome_options.add_argument("--headless")
-        chrome_options.add_argument("--no-sandbox")
-        chrome_options.add_argument("--disable-dev-shm-usage")
-        chrome_options.add_argument("--window-size=1280,1024")
-        
-        # Initialize the driver
-        st.info("Setting up Chrome browser...")
-        driver = webdriver.Chrome(
-            service=Service(ChromeDriverManager().install()),
-            options=chrome_options
-        )
-        
-        # Process each frame
-        st.info(f"Processing {len(frames)} frames...")
-        progress_bar = st.progress(0)
-        for i, html_content in enumerate(frames):
-            # Save HTML to a temporary file
-            html_path = os.path.join(temp_dir, f"frame_{i}.html")
-            with open(html_path, "w", encoding="utf-8") as f:
-                f.write(html_content)
-            frame_paths.append(html_path)
-            
-            # Load the HTML in the browser
-            driver.get(f"file://{html_path}")
-            
-            # Wait for map to load (adjust if needed)
-            time.sleep(1.5)  # Increased wait time
-            
-            # Take a screenshot
-            screenshot_path = os.path.join(temp_dir, f"screenshot_{i}.png")
-            driver.save_screenshot(screenshot_path)
-            screenshot_paths.append(screenshot_path)
-            
-            # Update progress
-            progress_bar.progress((i+1)/len(frames))
-        
-        # Close the browser
-        driver.quit()
-        
-        # Create GIF from screenshots
-        images = []
-        for img_path in screenshot_paths:
-            if os.path.exists(img_path) and os.path.getsize(img_path) > 0:
-                try:
-                    images.append(Image.open(img_path))
-                except Exception as e:
-                    st.warning(f"Could not process image {img_path}: {str(e)}")
-        
-        # Check if we have any valid images
-        if not images:
-            st.error("No valid images were captured. Cannot create GIF.")
-            return None
-        
-        st.info(f"Creating GIF with {len(images)} frames...")
-        # Calculate duration based on frames per second
-        duration = int(1000 / fps)  # Convert to milliseconds
-        
-        # Save as GIF
-        gif_buffer = BytesIO()
-        images[0].save(
-            gif_buffer,
-            format='GIF',
-            append_images=images[1:],
-            save_all=True,
-            duration=duration,
-            loop=0  # Loop forever
-        )
-        gif_buffer.seek(0)
-        
-        # Clean up temporary files
-        for path in frame_paths + screenshot_paths:
-            if os.path.exists(path):
-                os.remove(path)
-        os.rmdir(temp_dir)
-        
-        st.success("GIF created successfully!")
-        return gif_buffer.getvalue()
-    
-    except Exception as e:
-        st.error(f"Error creating GIF: {str(e)}")
-        # Clean up in case of error
-        for path in frame_paths + screenshot_paths:
-            if os.path.exists(path) and os.path.isfile(path):
-                try:
-                    os.remove(path)
-                except:
-                    pass
-        if os.path.exists(temp_dir) and os.path.isdir(temp_dir):
-            try:
-                os.rmdir(temp_dir)
-            except:
-                pass
-        return None
-
-def export_timeline(df, cluster_id, category, playback_dates, basemap_tiles, basemap):
-    """Create a timeline export as GIF or MP4"""
-    # Check if we have valid timeline data to export
-    if not playback_dates or len(playback_dates) <= 1 or cluster_id is None:
-        st.warning(f"No multi-date timeline data available to export. This {get_category_singular(category)} must appear on multiple dates for timeline export.")
-        return
-    
-    # Get data for the selected cluster
-    cluster_data = df[df['cluster'] == cluster_id]
-    
-    # Group by date and count points
-    date_counts = cluster_data.groupby('acq_date').size()
-    dates_with_data = list(date_counts.index)
-    
-    # Check if we have at least 2 dates with data
-    if len(dates_with_data) <= 1:
-        st.warning(f"This {get_category_singular(category)} only has data for one date. Timeline export requires data on multiple dates.")
-        return
-    
-    # Set up progress bar
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    # Capture frames for each date
-    frames = []
-    total_dates = len(dates_with_data)
-    
-    for i, date in enumerate(sorted(dates_with_data)):
-        status_text.write(f"Processing frame {i+1}/{total_dates}: {date}")
-        progress_bar.progress((i+1)/total_dates)
-        
-        # Create map for this date
-        playback_title = f"{get_category_display_name(category)} {cluster_id} - {date}"
-        
-        # Filter data for this date and cluster
-        date_data = df[(df['cluster'] == cluster_id) & (df['acq_date'] == date)].copy()
-        
-        if not date_data.empty:
-            # Create a simplified map for export
-            folium_map = create_export_map(date_data, playback_title, basemap_tiles, basemap)
-            frames.append(folium_map)
-    
-    status_text.write("Processing complete. Preparing download...")
-    
-    # Store frames in session state
-    st.session_state.frames = frames
-    
-    # Provide download option
-    if frames:
-        # Create download buffer
-        st.info("Timeline export ready for download")
-        st.download_button(
-            label="Download as GIF",
-            data=create_gif_from_frames(frames),
-            file_name=f"{category}_{cluster_id}_timeline.gif",
-            mime="image/gif",
-            key="download_gif_btn",
-            use_container_width=True
-        )
-        progress_bar.empty()
-        status_text.empty()
-    else:
-        st.error("Failed to create timeline export - no frames were generated")
-        progress_bar.empty()
-        status_text.empty()
-
-def plot_fire_detections_folium(df, title="Fire Detections", selected_cluster=None, playback_mode=False, playback_date=None, dot_size_multiplier=1.0, color_palette='inferno', category="fires"):
+def plot_fire_detections_folium(df, title="Fire Detections", selected_cluster=None, playback_mode=True, playback_date=None, dot_size_multiplier=1.0, color_palette='inferno', category="fires"):
     """Plot fire detections on a folium map with color palette based on temperature"""
     
     # Create a working copy of the dataframe
@@ -1155,25 +836,13 @@ def plot_fire_detections_folium(df, title="Fire Detections", selected_cluster=No
     # Apply cluster selection filter if a cluster is selected
     if selected_cluster is not None and selected_cluster in plot_df['cluster'].values:
         # Filter for just the selected cluster
-        selected_data = plot_df[plot_df['cluster'] == selected_cluster].copy()
-        other_data = plot_df[plot_df['cluster'] != selected_cluster].copy()
-        
-        # Update title if filtering is applied
+        plot_df = plot_df[plot_df['cluster'] == selected_cluster].copy()
+        # Get category display name for title
         category_display = get_category_display_name(category)
         title = f"{title} - {category_display} {selected_cluster}"
-        
-        # If in playback mode, further filter by date
-        if playback_mode and playback_date is not None:
-            selected_data = selected_data[selected_data['acq_date'] == playback_date].copy()
-            # Add date to title
-            title = f"{title} - {playback_date}"
-            # No need to show other data in playback mode
-            other_data = pd.DataFrame()
-            
-        # Replace plot_df with filtered version
-        plot_df = pd.concat([selected_data, other_data])
-    elif playback_mode and playback_date is not None:
-        # Filter by date only if no cluster is selected
+    
+    # Then apply playback filter if in playback mode
+    if playback_mode and playback_date is not None:
         plot_df = plot_df[plot_df['acq_date'] == playback_date].copy()
         title = f"{title} - {playback_date}"
     
@@ -1219,13 +888,6 @@ def plot_fire_detections_folium(df, title="Fire Detections", selected_cluster=No
     temp_col = get_temp_column(plot_df)
     
     # Set the initial tiles based on basemap parameter (defaulting to dark if not specified)
-    basemap_tiles = {
-        'Dark': 'cartodbdark_matter',
-        'Light': 'cartodbpositron',
-        'Satellite': 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-        'Terrain': 'stamenterrain'
-    }
-    
     initial_tiles = 'cartodbdark_matter'
     basemap = st.session_state.get('basemap', 'Dark')
     if basemap in basemap_tiles:
@@ -1235,6 +897,8 @@ def plot_fire_detections_folium(df, title="Fire Detections", selected_cluster=No
                   tiles=initial_tiles)  # Set the base map from user selection
     
     Fullscreen().add_to(m)
+    
+    
     
     # Automatically zoom to fit all points
     m.fit_bounds([[min_lat, min_lon], [max_lat, max_lon]], padding=(50, 50))
@@ -1360,12 +1024,19 @@ def plot_fire_detections_folium(df, title="Fire Detections", selected_cluster=No
                 <p><b>Time:</b> {point['acq_time']}</p>
                 <p><b>FRP:</b> {point['frp']:.2f}</p>
                 <p><b>Coordinates:</b> {point['latitude']:.4f}, {point['longitude']:.4f}</p>
-                <p style="color: #4CAF50; font-weight: bold;">
-                    To select this cluster, use the dropdown menu below the map
-                </p>
+                <a href="?selected_cluster={point['cluster']}" 
+                style="display: inline-block; 
+                        background-color: #4CAF50; 
+                        color: white; 
+                        padding: 10px 20px; 
+                        border: none; 
+                        border-radius: 5px; 
+                        cursor: pointer; 
+                        text-decoration: none;">
+                    Select Cluster {point['cluster']}
+                </a>
             </div>
             """
-            
             popup = folium.Popup(popup_html, max_width=300)
 
             folium.CircleMarker(
@@ -1415,6 +1086,8 @@ def plot_fire_detections_folium(df, title="Fire Detections", selected_cluster=No
     if temp_col:
         colormap.add_to(m)
     
+    folium.LayerControl().add_to(m)
+    
     # Add an interaction explanation with instructions to use UI for selection
     info_text = """
     <div style="position: fixed; 
@@ -1430,7 +1103,7 @@ def plot_fire_detections_folium(df, title="Fire Detections", selected_cluster=No
         <b>Interaction:</b><br>
         • Hover over points to see details<br>
         • Click points to view full information<br>
-        • Use the dropdown menu below the map to select clusters<br>
+        • Use the dropdown menu on the right to select clusters<br>
         • Zoom with +/- or mouse wheel<br>
         • Change base maps with layer control (top right)
     </div>
@@ -1618,16 +1291,12 @@ def plot_feature_time_series(df, cluster_id, features):
     except Exception as e:
         st.warning(f"Error creating chart: {str(e)}")
         return None
+        
 
-def display_feature_exploration(df, cluster_id, category, current_date=None, caller_id=None):
+def display_feature_exploration(df, cluster_id, category, current_date=None):
     """Display feature exploration interface for the selected cluster"""
     if df is None or df.empty or cluster_id is None:
         return
-    
-    # Create a unique key suffix based on caller and date if needed
-    key_suffix = f"_{caller_id}" if caller_id else ""
-    if current_date:
-        key_suffix += f"_{current_date}"
     
     # Filter data for the selected cluster
     cluster_data = df[df['cluster'] == cluster_id].copy()
@@ -1668,8 +1337,9 @@ def display_feature_exploration(df, cluster_id, category, current_date=None, cal
     
     selected_features = []
     
-    frp_key = f"show_frp_{cluster_id}{key_suffix}"
-    temp_key = f"show_temp_{cluster_id}{key_suffix}"
+    playback_suffix = f"_playback_{current_date}" if current_date is not None else ""
+    frp_key = f"show_frp_{cluster_id}{playback_suffix}"
+    temp_key = f"show_temp_{cluster_id}{playback_suffix}"
     
     with cols[0]:
         if 'frp' in available_features:
@@ -1700,11 +1370,12 @@ def display_feature_exploration(df, cluster_id, category, current_date=None, cal
                             summary[f"Average {feature_name}"] = f"{mean_val:.2f}"
                             summary[f"Maximum {feature_name}"] = f"{max_val:.2f}"
                 
-                # Display the summary in metrics
-                metric_cols = st.columns(len(summary))
-                for i, (key, value) in enumerate(summary.items()):
-                    with metric_cols[i]:
+                # Display the summary
+                if summary:
+                    for key, value in summary.items():
                         st.metric(key, value)
+                else:
+                    st.info("No valid numerical data available for this date.")
             else:
                 st.info("No data available for this date.")
         else:
@@ -1728,8 +1399,6 @@ def display_feature_exploration(df, cluster_id, category, current_date=None, cal
     else:
         st.info("Please select at least one feature to visualize.")
         
-
-
 def display_coordinate_view(df, playback_date=None):
     """Display a table with coordinates and details for the selected cluster"""
     if df is None or df.empty:
@@ -1839,9 +1508,30 @@ def create_arrow_navigation(key_suffix=""):
         if next_clicked and playback_index < len(playback_dates) - 1:
             st.session_state.playback_index += 1
             st.rerun()
+    
+    # Add JavaScript for keyboard navigation
+    
+    js_code = """
+    <script>
+    document.addEventListener('keydown', function(e) {
+        if (e.key === 'ArrowRight') {
+            // Find and click the next button
+            const nextBtn = document.querySelector('button:contains("▶")');
+            if (nextBtn) nextBtn.click();
+        } else if (e.key === 'ArrowLeft') {
+            // Find and click the previous button
+            const prevBtn = document.querySelector('button:contains("◀")');
+            if (prevBtn) prevBtn.click();
+        }
+    });
+    </script>
+    """
+    
+    st.components.v1.html(js_code, height=0)
+    
 
-def handle_url_parameters():
-    """Handle URL parameters for cluster selection"""
+def handle_url_parameters(category=None):
+    """Handle URL parameters with auto-playback mode for map selections"""
     # Check if selected_cluster parameter exists
     if 'selected_cluster' in st.query_params:
         try:
@@ -1851,8 +1541,8 @@ def handle_url_parameters():
             # Clear the URL parameter immediately to prevent reprocessing
             del st.query_params['selected_cluster']
             
-            # Skip further processing if there's no valid results
-            if 'results' not in st.session_state or st.session_state.results is None:
+            # Skip further processing if category isn't defined yet
+            if category is None or 'results' not in st.session_state or st.session_state.results is None:
                 return
                 
             # Check if it's a new selection
@@ -1871,14 +1561,54 @@ def handle_url_parameters():
                 # Enable playback mode when selecting from map
                 st.session_state.playback_mode = True
                 
-                # Rerun to update UI
-                st.rerun()
+                # Update cluster dropdown to match if it exists
+                if 'cluster_select' in st.session_state and 'cluster_options' in st.session_state:
+                    cluster_name = f"{get_category_display_name(category)} {cluster_id}"
+                    if cluster_name in st.session_state['cluster_options']:
+                        st.session_state.cluster_select = cluster_name
+                
+                # Use a safer rerun approach
+                raise st.runtime.scriptrunner.RerunException(st.runtime.scriptrunner.RerunData(None))
         except (ValueError, TypeError):
             # Invalid cluster ID, ignore it
             if 'selected_cluster' in st.query_params:
                 del st.query_params['selected_cluster']
 
+
+# Other helper functions
+def clear_stale_state():
+    """Clean up any stale state that might be causing issues"""
+    # Check for and clean up potentially problematic session state
+    if "processed_params" in st.session_state:
+        # Clean up old tracked parameters (older than 10 minutes)
+        current_time = time.time()
+        keys_to_remove = []
+        for key, timestamp in st.session_state.processed_params.items():
+            if current_time - timestamp > 600:  # 10 minutes
+                keys_to_remove.append(key)
+        
+        for key in keys_to_remove:
+            del st.session_state.processed_params[key]
+    
+    # Make sure URL parameters are clean
+    if 'selected_cluster' in st.query_params:
+        # If any query params were left over from a previous run,
+        # clear them for a fresh start
+        del st.query_params['selected_cluster']
+                
 def main():
+    # Clean up stale state
+    clear_stale_state()
+    
+    cluster_id = None
+    if 'selected_cluster' in st.query_params:
+        try:
+            cluster_id = int(st.query_params['selected_cluster'])
+            del st.query_params['selected_cluster']
+        except (ValueError, TypeError):
+            if 'selected_cluster' in st.query_params:
+                del st.query_params['selected_cluster']
+    
     # Create a two-column layout for the main interface
     main_cols = st.columns([1, 3])
     
@@ -1887,7 +1617,7 @@ def main():
         st.subheader("Analysis Settings")
         
         # Country selection
-        st.write("Please select your location")
+        st.write("Please select your country")
         country_options = {
             'Afghanistan': '60.52,29.31,75.15,38.48',
             'United States': '-125.0,24.0,-66.0,50.0',
@@ -1898,14 +1628,155 @@ def main():
             'Canada': '-141.0,41.7,-52.6,83.0',
             'Russia': '19.25,41.151,180.0,81.2',
             'Indonesia': '95.0,-11.0,141.0,6.0',
-            # ... other countries would be here
+            'Mongolia': '87.76,41.59,119.93,52.15',
+            'Kazakhstan': '46.46,40.57,87.36,55.45',
+            'Mexico': '-118.4,14.5,-86.4,32.7',
+            'Argentina': '-73.6,-55.1,-53.6,-21.8',
+            'Chile': '-75.6,-55.9,-66.9,-17.5',
+            'South Africa': '16.3,-34.8,32.9,-22.1',
+            'New Zealand': '166.3,-47.3,178.6,-34.4',
+            'Thailand': '97.3,5.6,105.6,20.5',
+            'Vietnam': '102.1,8.4,109.5,23.4',
+            'Malaysia': '99.6,0.8,119.3,7.4',
+            'Myanmar': '92.2,9.8,101.2,28.5',
+            'Philippines': '116.9,4.6,126.6,19.6',
+            'Papua New Guinea': '140.8,-11.7,155.6,-1.3',
+            'Greece': '19.4,34.8,28.3,41.8',
+            'Turkey': '26.0,36.0,45.0,42.0',
+            'Spain': '-9.3,36.0,4.3,43.8',
+            'Portugal': '-9.5,37.0,-6.2,42.2',
+            'Italy': '6.6,35.5,18.5,47.1',
+            'France': '-5.1,41.3,9.6,51.1',
+            'Germany': '5.9,47.3,15.0,55.1',
+            'Ukraine': '22.1,44.4,40.2,52.4',
+            'Sweden': '11.1,55.3,24.2,69.1',
+            'Norway': '4.5,58.0,31.1,71.2',
+            'Finland': '20.6,59.8,31.6,70.1',
+            'Japan': '129.5,31.4,145.8,45.5',
+            'South Korea': '126.1,33.1,129.6,38.6',
+            'North Korea': '124.2,37.7,130.7,43.0',
+            'Iran': '44.0,25.1,63.3,39.8',
+            'Iraq': '38.8,29.1,48.8,37.4',
+            'Saudi Arabia': '34.6,16.3,55.7,32.2',
+            'Egypt': '24.7,22.0,36.9,31.7',
+            'Libya': '9.3,19.5,25.2,33.2',
+            'Algeria': '-8.7,19.1,12.0,37.1',
+            'Morocco': '-13.2,27.7,-1.0,35.9',
+            'Sudan': '21.8,8.7,38.6,22.2',
+            'South Sudan': '23.4,3.5,35.9,12.2',
+            'Ethiopia': '33.0,3.4,47.9,14.8',
+            'Kenya': '33.9,-4.7,41.9,5.0',
+            'Tanzania': '29.3,-11.7,40.4,-1.0',
+            'Uganda': '29.5,-1.4,35.0,4.2',
+            'Nigeria': '2.7,4.3,14.7,13.9',
+            'Ghana': '-3.3,4.7,1.2,11.2',
+            'Ivory Coast': '-8.6,4.4,-2.5,10.7',
+            'Guinea': '-15.1,7.2,-7.6,12.7',
+            'Somalia': '40.9,-1.7,51.4,11.9',
+            'Democratic Republic of the Congo': '12.2,-13.5,31.3,5.3',
+            'Angola': '11.7,-18.0,24.1,-4.4',
+            'Namibia': '11.7,-28.9,25.3,-16.9',
+            'Zambia': '22.0,-18.0,33.7,-8.2',
+            'Zimbabwe': '25.2,-22.4,33.1,-15.6',
+            'Mozambique': '30.2,-26.9,40.9,-10.5',
+            'Madagascar': '43.2,-25.6,50.5,-11.9',
+            'Colombia': '-79.0,-4.2,-66.9,12.5',
+            'Venezuela': '-73.4,0.6,-59.8,12.2',
+            'Peru': '-81.3,-18.4,-68.7,-0.0',
+            'Bolivia': '-69.6,-22.9,-57.5,-9.7',
+            'Paraguay': '-62.6,-27.6,-54.3,-19.3',
+            'Uruguay': '-58.4,-34.9,-53.1,-30.1',
+            'Ecuador': '-81.0,-5.0,-75.2,1.4',
+            'French Guiana': '-54.6,2.1,-51.6,5.8',
+            'Suriname': '-58.1,1.8,-54.0,6.0',
+            'Guyana': '-61.4,1.2,-56.5,8.6',
+            'Panama': '-83.0,7.2,-77.1,9.7',
+            'Costa Rica': '-85.9,8.0,-82.5,11.2',
+            'Nicaragua': '-87.7,10.7,-83.1,15.0',
+            'Honduras': '-89.4,12.9,-83.1,16.5',
+            'El Salvador': '-90.1,13.1,-87.7,14.5',
+            'Guatemala': '-92.2,13.7,-88.2,17.8',
+            'Belize': '-89.2,15.9,-87.8,18.5',
+            'Cuba': '-85.0,19.8,-74.1,23.2',
+            'Haiti': '-74.5,18.0,-71.6,20.1',
+            'Dominican Republic': '-72.0,17.5,-68.3,20.0',
+            'Jamaica': '-78.4,17.7,-76.2,18.5',
+            'Puerto Rico': '-67.3,17.9,-65.6,18.5',
+            'Bahamas': '-79.0,20.9,-72.7,27.3',
+            'Trinidad and Tobago': '-61.9,10.0,-60.5,11.3',
+            'Bangladesh': '88.0,20.6,92.7,26.6',
+            'Nepal': '80.0,26.3,88.2,30.4',
+            'Bhutan': '88.7,26.7,92.1,28.3',
+            'Sri Lanka': '79.6,5.9,81.9,9.8',
+            'Maldives': '72.7,-0.7,73.8,7.1',
+            'Pakistan': '61.0,23.5,77.8,37.1',
+            'Afghanistan': '60.5,29.4,74.9,38.5',
+            'Uzbekistan': '56.0,37.2,73.1,45.6',
+            'Turkmenistan': '52.5,35.1,66.7,42.8',
+            'Tajikistan': '67.3,36.7,75.2,41.0',
+            'Kyrgyzstan': '69.3,39.2,80.3,43.3',
+            'Cambodia': '102.3,10.4,107.6,14.7',
+            'Laos': '100.1,13.9,107.7,22.5',
+            'Taiwan': '120.0,21.9,122.0,25.3',
+            'United Arab Emirates': '51.5,22.6,56.4,26.1',
+            'Oman': '52.0,16.6,59.8,26.4',
+            'Yemen': '42.5,12.5,54.0,19.0',
+            'Kuwait': '46.5,28.5,48.4,30.1',
+            'Qatar': '50.7,24.5,51.6,26.2',
+            'Bahrain': '50.4,25.8,50.8,26.3',
+            'Jordan': '34.9,29.2,39.3,33.4',
+            'Lebanon': '35.1,33.0,36.6,34.7',
+            'Syria': '35.7,32.3,42.4,37.3',
+            'Israel': '34.2,29.5,35.9,33.3',
+            'Palestine': '34.9,31.2,35.6,32.6',
+            'Cyprus': '32.0,34.6,34.6,35.7',
+            'Iceland': '-24.5,63.3,-13.5,66.6',
+            'Ireland': '-10.5,51.4,-6.0,55.4',
+            'United Kingdom': '-8.2,49.9,1.8,58.7',
+            'Belgium': '2.5,49.5,6.4,51.5',
+            'Netherlands': '3.3,50.8,7.2,53.5',
+            'Luxembourg': '5.7,49.4,6.5,50.2',
+            'Switzerland': '5.9,45.8,10.5,47.8',
+            'Austria': '9.5,46.4,17.2,49.0',
+            'Hungary': '16.1,45.7,22.9,48.6',
+            'Slovakia': '16.8,47.7,22.6,49.6',
+            'Czech Republic': '12.1,48.5,18.9,51.1',
+            'Poland': '14.1,49.0,24.2,54.8',
+            'Denmark': '8.0,54.5,15.2,57.8',
+            'Estonia': '23.3,57.5,28.2,59.7',
+            'Latvia': '20.8,55.7,28.2,58.1',
+            'Lithuania': '20.9,53.9,26.8,56.5',
+            'Belarus': '23.2,51.3,32.8,56.2',
+            'Moldova': '26.6,45.5,30.2,48.5',
+            'Romania': '20.3,43.6,29.7,48.3',
+            'Bulgaria': '22.4,41.2,28.6,44.2',
+            'Serbia': '18.8,42.2,23.0,46.2',
+            'Croatia': '13.5,42.4,19.4,46.6',
+            'Bosnia and Herzegovina': '15.7,42.6,19.6,45.3',
+            'Slovenia': '13.4,45.4,16.6,46.9',
+            'Albania': '19.3,39.6,21.1,42.7',
+            'North Macedonia': '20.4,40.8,23.0,42.4',
+            'Montenegro': '18.4,41.9,20.4,43.6',
+            'New Caledonia': '164.0,-22.7,167.0,-20.0',
+            'Fiji': '177.0,-19.2,180.0,-16.0',
+            'Vanuatu': '166.0,-20.3,170.0,-13.0',
+            'Solomon Islands': '155.0,-11.0,170.0,-5.0',
+            'Timor-Leste': '124.0,-9.5,127.3,-8.1',
+            'Palau': '131.1,2.8,134.7,8.1',
+            'Micronesia': '138.0,1.0,163.0,10.0',
+            'Marshall Islands': '160.0,4.0,172.0,15.0',
+            'Kiribati': '-175.0,-5.0,177.0,5.0',
+            'Tuvalu': '176.0,-10.0,180.0,-5.0',
+            'Samoa': '-172.8,-14.1,-171.4,-13.4',
+            'Tonga': '-175.4,-22.4,-173.7,-15.5',
+            'Cook Islands': '-166.0,-22.0,-157.0,-8.0',
         }
         country = st.selectbox(
-            "Please select",
+            "Please select",  # Empty label since we have the header
             list(country_options.keys())
         )
         
-        # Dataset selection - keep checkboxes
+        # Dataset selection - remove dropdown, keep checkboxes
         st.subheader("Select Datasets")
         
         datasets = {}
@@ -1930,14 +1801,39 @@ def main():
             help="""
             Fires: Temperature > 300K, FRP > 1.0 (VIIRS) or Confidence > 80% (MODIS)
             Gas Flares: Temperature > 1000K, typically industrial sources
+            Volcanic Activity: Temperature > 1300K, clustered near known volcanic regions
             Raw Data: All data points including noise points not assigned to clusters
             """
         )
         
+        if cluster_id is not None and 'results' in st.session_state and st.session_state.results is not None:
+            if st.session_state.get('selected_cluster') != cluster_id:
+                # This is from the map, so enable playback mode
+                st.session_state.selected_cluster = cluster_id
+                
+                # Get unique dates
+                cluster_points = st.session_state.results[st.session_state.results['cluster'] == cluster_id]
+                unique_dates = sorted(cluster_points['acq_date'].unique())
+                
+                # Store the dates
+                st.session_state.playback_dates = unique_dates
+                st.session_state.playback_index = 0
+                
+                # Enable playback mode for map selections
+                st.session_state.playback_mode = True
+                
+                # Update dropdown if it exists
+                if 'cluster_options' in st.session_state:
+                    cluster_name = f"{get_category_display_name(category)} {cluster_id}"
+                    if cluster_name in st.session_state['cluster_options']:
+                        st.session_state.cluster_select = cluster_name
+                
+                # Rerun
+                st.rerun()
+        
         # Date range selection
         st.subheader("Select Date Range")
-        today = datetime.now()
-        default_end_date = today
+        default_end_date = datetime.now()
         default_start_date = default_end_date - timedelta(days=7)
         
         date_cols = st.columns(2)
@@ -1946,7 +1842,7 @@ def main():
             start_date = st.date_input(
                 "Start Date",
                 value=default_start_date,
-                max_value=today
+                max_value=default_end_date
             )
         
         with date_cols[1]:
@@ -1954,10 +1850,8 @@ def main():
                 "End Date",
                 value=default_end_date,
                 min_value=start_date,
-                max_value=today
+                max_value=default_end_date
             )
-            
-        
         
         # Calculate date range in days
         date_range_days = (end_date - start_date).days
@@ -1969,25 +1863,6 @@ def main():
         if country in large_countries and date_range_days > 14:
             st.warning(f"⚠️ You selected a {date_range_days}-day period for {country}, which is a large country. This may take a long time to process. Consider reducing your date range to 14 days or less for faster results.")
         
-        with st.expander("Advanced Clustering Settings"):
-            # Two-column layout for clustering parameters
-            clust_cols = st.columns(2)
-            
-            with clust_cols[0]:
-                eps_val = st.slider("Spatial Proximity (eps)", 0.005, 0.05, value=0.01, step=0.001, 
-                                    help="DBSCAN eps parameter. Higher values create larger clusters.")
-            
-            with clust_cols[1]:
-                min_samples_val = st.slider("Minimum Points", 3, 15, value=5, step=1,
-                                        help="Minimum points required to form a cluster.")
-                
-            use_clustering = st.checkbox("Use Clustering", value=True, 
-                                    help="Group nearby detections into clusters for easier analysis.")
-                                    
-            # Add time-based clustering parameter
-            max_time_diff = st.slider("Max Days Between Events (Same Cluster)", 1, 10, value=5, step=1,
-                                    help="Maximum days between fire events to be considered same cluster. Lower values create more temporally distinct clusters.")
-                
         # API credentials (hidden in expander)
         with st.expander("API Settings"):
             username = st.text_input("FIRMS Username", value="tombrown4444")
@@ -1998,17 +1873,17 @@ def main():
         st.markdown('<style>.stButton button { font-size: 20px; padding: 15px; }</style>', unsafe_allow_html=True)
         generate_button = st.button("Generate Analysis", key="generate_button", use_container_width=True)
         
-        if generate_button:
+        # Add logic to check if we should proceed with analysis
+        proceed_with_analysis = True
+        
+        if generate_button and proceed_with_analysis:
             with st.spinner("Analyzing fire data..."):
                 handler = FIRMSHandler(username, password, api_key)
                 results = handler.fetch_fire_data(
                     country=country,
                     dataset=dataset,
                     category=category,
-                    start_date=start_date,
-                    end_date=end_date,
-                    use_clustering=True,
-                    chunk_days=7
+                    use_clustering=True
                 )
                 # Store results in session state
                 st.session_state.results = results
@@ -2018,10 +1893,10 @@ def main():
                 st.session_state.playback_mode = False
                 
     with main_cols[1]:
-        # Handle URL parameters
+        # First handle URL parameters
         handle_url_parameters()
         
-        # Main map and visualization section
+        # Then check for results
         if 'results' in st.session_state and st.session_state.results is not None and not st.session_state.results.empty:
             # Get category display name for UI
             category_display = get_category_display_name(category)
@@ -2029,11 +1904,11 @@ def main():
             st.subheader(f"Detection Map")
             
             # Set up variables for map creation
-            map_settings = {
+            map_settings = st.session_state.get('map_settings', {
                 'color_palette': 'inferno',
                 'basemap': 'Dark',
                 'dot_size_multiplier': 1.0
-            }
+            })
             
             # Check if we're in playback mode
             if not st.session_state.get('playback_mode', False):
@@ -2051,11 +1926,50 @@ def main():
                 if folium_map:
                     # Display the folium map
                     html_map = folium_map._repr_html_()
-                    components.html(html_map, height=550, width=None)
+                    components.html(html_map, height=550, width=985)
+                    
+                    # If a cluster is selected, show timeline options
+                    if st.session_state.get('selected_cluster') is not None:
+                        # Check if this cluster has data for multiple dates
+                        cluster_data = st.session_state.results[st.session_state.results['cluster'] == st.session_state.selected_cluster]
+                        unique_dates = sorted(cluster_data['acq_date'].unique())
+                        
+                        if len(unique_dates) > 1:
+                            st.markdown("---")
+                            st.subheader(f"{get_category_display_name(category)} {st.session_state.selected_cluster} Timeline")
+                            
+                            # Container for timeline buttons
+                            timeline_cols = st.columns([1, 1])
+                            
+                            with timeline_cols[0]:
+                                if st.button("View Timeline", key="view_timeline_btn", use_container_width=True):
+                                    # Enable playback mode
+                                    st.session_state.playback_mode = True
+                                    st.session_state.playback_dates = unique_dates
+                                    st.session_state.playback_index = 0
+                                    st.rerun()
+                            
+                            with timeline_cols[1]:
+                                if st.button("Export Timeline", key="export_timeline_btn", use_container_width=True):
+                                    export_timeline(
+                                        st.session_state.results, 
+                                        st.session_state.selected_cluster,
+                                        category,
+                                        unique_dates,
+                                        basemap_tiles,
+                                        map_settings.get('basemap', 'Dark')
+                                    )
+                        else:
+                            st.info(f"This {get_category_singular(category)} only appears on one date. Timeline features require data on multiple dates.")
+                    
+                    # Display feature exploration if a cluster is selected (not in playback mode)
+                    if st.session_state.get('selected_cluster') is not None:
+                        # Display feature exploration directly under map
+                        display_feature_exploration(st.session_state.results, st.session_state.get('selected_cluster'), category)
                 else:
                     st.warning("No data to display on the map.")
             else:
-                # PLAYBACK MODE - Timeline view
+                # PLAYBACK MODE - We're in playback mode - get current date
                 playback_dates = st.session_state.get('playback_dates', [])
                 playback_index = st.session_state.get('playback_index', 0)
                 
@@ -2064,6 +1978,13 @@ def main():
                     
                     # Create the playback visualization
                     playback_title = f"{category_display} {st.session_state.get('selected_cluster')} - {current_date}"
+                    
+                    # Get map settings safely
+                    map_settings = st.session_state.get('map_settings', {
+                        'color_palette': 'inferno',
+                        'basemap': 'Dark',
+                        'dot_size_multiplier': 1.0
+                    })
                     
                     folium_map = plot_fire_detections_folium(
                         st.session_state.results,
@@ -2077,156 +1998,399 @@ def main():
                     )
                     
                     if folium_map:
-                        # Save the map to an HTML string and display it
+                        # Save the map to an HTML string and display it using components
                         html_map = folium_map._repr_html_()
-                        components.html(html_map, height=550, width=None)
-                    else:
-                        st.warning("No data to display for the current date.")
-            
-            # Display cluster selection dropdown
-            st.markdown("---")
-            st.subheader("Select a Cluster for Analysis")
-            
-            if 'results' in st.session_state and st.session_state.results is not None:
-                # Create cluster summary for dropdown
-                cluster_summary = create_cluster_summary(st.session_state.results, category)
-                
-                if cluster_summary is not None:
-                    # Get all valid clusters
-                    clusters = sorted(cluster_summary['cluster'].tolist())
-                    
-                    # Create dropdown options with additional info
-                    options = ["None"]
-                    for cluster_id in clusters:
-                        cluster_info = cluster_summary[cluster_summary['cluster'] == cluster_id]
-                        points = cluster_info['Number of Points'].values[0]
-                        frp = cluster_info['Mean FRP'].values[0]
-                        options.append(f"Cluster {cluster_id} ({points} points, FRP: {frp:.2f})")
-                    
-                    # Display the dropdown
-                    selected = st.selectbox(
-                        "Choose a cluster to view details and timeline",
-                        options=options,
-                        key="cluster_selectbox"
-                    )
-                    
-                    # Extract cluster ID if selected
-                    if selected != "None":
-                        cluster_match = re.search(r"Cluster (\d+)", selected)
-                        if cluster_match:
-                            selected_cluster = int(cluster_match.group(1))
-                            
-                            # Update session state if different from current selection
-                            if selected_cluster != st.session_state.get('selected_cluster'):
-                                st.session_state.selected_cluster = selected_cluster
-                                
-                                # Get dates for this cluster
-                                cluster_data = st.session_state.results[
-                                    st.session_state.results['cluster'] == selected_cluster
-                                ]
-                                unique_dates = sorted(cluster_data['acq_date'].unique())
-                                
-                                # Store dates in session state
-                                st.session_state.playback_dates = unique_dates
-                                st.session_state.playback_index = 0
-                                
-                                # Reset playback mode when selecting a new cluster
-                                st.session_state.playback_mode = False
-                                
-                                # Rerun to update UI
-                                st.rerun()
-                    else:
-                        # If "None" selected, clear the selected cluster
-                        if st.session_state.get('selected_cluster') is not None:
-                            st.session_state.selected_cluster = None
-                            st.session_state.playback_mode = False
-                            st.rerun()
-            
-            # If a cluster is selected, show timeline options and analysis
-            if st.session_state.get('selected_cluster') is not None:
-                cluster_data = st.session_state.results[
-                    st.session_state.results['cluster'] == st.session_state.selected_cluster
-                ]
-                unique_dates = sorted(cluster_data['acq_date'].unique())
-                
-                # Show timeline options if there are multiple dates
-                if len(unique_dates) > 1:
-                    st.markdown("---")
-                    st.subheader(f"Timeline Options for Cluster {st.session_state.selected_cluster}")
-                    
-                    # Display timeline controls based on playback mode
-                    if st.session_state.get('playback_mode', False):
-                        # We're in playback mode - show navigation controls
-                        create_arrow_navigation(key_suffix="main_view")
+                        components.html(html_map, height=550, width=985)
                         
-                        # Exit button
+                        # Create timeline navigation
+                        st.markdown("---")
+                        st.subheader(f"{get_category_display_name(category)} {st.session_state.selected_cluster} Timeline")
+                        
+                        # Show feature exploration for the current date
+                        if st.session_state.selected_cluster is not None:
+                            # Use the updated function with the current date parameter
+                            display_feature_exploration(
+                                st.session_state.results, 
+                                st.session_state.selected_cluster, 
+                                category, 
+                                current_date
+                            )
+                        
+                        # Create button columns for navigation
+                        col1, col2, col3 = st.columns([1, 4, 1])
+                        
+                        with col1:
+                            prev_clicked = st.button("◀", key="prev_btn", help="Previous Date")
+                            if prev_clicked and playback_index > 0:
+                                st.session_state.playback_index -= 1
+                                st.rerun()
+                        
+                        with col2:
+                            total_dates = len(playback_dates)
+                            
+                            # Date slider
+                            date_index = st.slider(
+                                "Select Date", 
+                                0, 
+                                total_dates - 1, 
+                                playback_index,
+                                key="date_slider",
+                                help="Use slider or arrow buttons to change the date"
+                            )
+                            
+                            # Update index if slider changed
+                            if date_index != playback_index:
+                                st.session_state.playback_index = date_index
+                                st.rerun()
+                                
+                            st.write(f"**Current Date: {current_date}** (Day {playback_index + 1} of {total_dates})")
+                        
+                        with col3:
+                            next_clicked = st.button("▶", key="next_btn", help="Next Date")
+                            if next_clicked and playback_index < len(playback_dates) - 1:
+                                st.session_state.playback_index += 1
+                                st.rerun()
+                        
+                        # Export option
+                        if st.button("Export Timeline", key="export_timeline_btn", use_container_width=True):
+                            cluster_id = st.session_state.selected_cluster
+                            export_timeline(
+                                st.session_state.results, 
+                                cluster_id,
+                                category,
+                                playback_dates,
+                                basemap_tiles,
+                                map_settings.get('basemap', 'Dark')
+                            )
+                        
+                        # Exit playback button
                         if st.button("Exit Timeline View", key="exit_timeline_btn", use_container_width=True):
                             st.session_state.playback_mode = False
                             st.rerun()
-                    else:
-                        # Not in playback mode - show options to enter timeline or export
-                        cols = st.columns(2)
-                        with cols[0]:
-                            if st.button("View Timeline", key="view_timeline_btn", use_container_width=True):
-                                # Enable playback mode
-                                st.session_state.playback_mode = True
-                                st.session_state.playback_dates = unique_dates
-                                st.session_state.playback_index = 0
-                                st.rerun()
+            
+            # Check for URL parameters for cluster selection - do this regardless of playback mode
+            if 'selected_cluster' in st.query_params:
+                try:
+                    # Get cluster ID from URL parameters
+                    cluster_id = int(st.query_params['selected_cluster'])
+                    
+                    # Clear the URL parameters immediately to avoid reprocessing
+                    for key in list(st.query_params.keys()):
+                        del st.query_params[key]
+                    
+                    # Only update if it's a different cluster
+                    if st.session_state.get('selected_cluster') != cluster_id:
+                        # Update selected cluster
+                        st.session_state.selected_cluster = cluster_id
                         
-                        with cols[1]:
-                            if st.button("Export Timeline", key="export_timeline_btn", use_container_width=True):
-                                # Define the basemap_tiles dictionary if not defined globally
-                                basemap_tiles = {
-                                    'Dark': 'cartodbdark_matter',
-                                    'Light': 'cartodbpositron',
-                                    'Satellite': 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-                                    'Terrain': 'stamenterrain'
-                                }
-                                
-                                export_timeline(
-                                    st.session_state.results, 
-                                    st.session_state.selected_cluster,
-                                    category,
-                                    unique_dates,
-                                    basemap_tiles,                   # This parameter was missing
-                                    map_settings.get('basemap', 'Dark')
-                                )
-                
-                # Show feature exploration for the selected cluster
+                        # Also update the cluster dropdown if it exists
+                        if 'cluster_select' in st.session_state and 'cluster_options' in st.session_state:
+                            # Find the corresponding option in the dropdown
+                            cluster_name = f"{get_category_display_name(category)} {cluster_id}"
+                            if cluster_name in st.session_state['cluster_options']:
+                                st.session_state.cluster_select = cluster_name
+                        
+                        # Rerun to update the UI with the new selection
+                        st.rerun()
+                except (ValueError, IndexError):
+                    # Invalid cluster ID, ignore it
+                    pass
+                    
+            # If a cluster is selected, show feature graphs under the map (not in playback mode)
+            if st.session_state.get('selected_cluster') is not None and not st.session_state.get('playback_mode', False):
+                # Display feature exploration directly under map
+                display_feature_exploration(st.session_state.results, st.session_state.get('selected_cluster'), category)
+            
+            # Show coordinate data at the bottom for selected cluster
+            if st.session_state.get('selected_cluster') is not None:
                 st.markdown("---")
-                
-                # If in playback mode, show data for current date
                 if st.session_state.get('playback_mode', False):
-                    current_date = st.session_state.playback_dates[st.session_state.playback_index]
-                    display_feature_exploration(
-                        st.session_state.results,
-                        st.session_state.selected_cluster,
-                        category,
-                        current_date,
-                        caller_id="playback_view"
-                    )
-                else:
-                    # Show overall data
-                    display_feature_exploration(
-                        st.session_state.results,
-                        st.session_state.selected_cluster,
-                        category,
-                        caller_id="normal_view"
-                    )
-                
-                # Show coordinate table at the bottom
-                st.markdown("---")
-                
-                # Display coordinates filtered by date if in playback mode
-                if st.session_state.get('playback_mode', False):
-                    current_date = st.session_state.playback_dates[st.session_state.playback_index]
-                    display_coordinate_view(st.session_state.results, current_date)
+                    playback_dates = st.session_state.get('playback_dates', [])
+                    playback_index = st.session_state.get('playback_index', 0)
+                    if playback_dates and playback_index < len(playback_dates):
+                        display_coordinate_view(st.session_state.results, playback_dates[playback_index])
                 else:
                     display_coordinate_view(st.session_state.results)
+        
+        # Create a collapsible sidebar for cluster summary table
+        # Use HTML/JS for the custom sidebar
+        cluster_summary = None
+        if 'results' in st.session_state and st.session_state.results is not None and not st.session_state.results.empty:
+            cluster_summary = create_cluster_summary(st.session_state.results, category)
+        
+        # Get category display name for UI
+        category_display = "Cluster"
+        if 'category' in locals() or 'category' in globals():
+            category_display = get_category_display_name(category)
+        
+        # Add JavaScript for toggling the sidebar
+        toggle_js = """
+        <script>
+        function toggleSidebar() {
+            const sidebar = document.querySelector('.cluster-sidebar');
+            const button = document.querySelector('.sidebar-toggle');
+            sidebar.classList.toggle('hidden');
+            button.classList.toggle('hidden');
+            if (sidebar.classList.contains('hidden')) {
+                button.innerHTML = '◀ Show """ + category_display + """ Table';
+            } else {
+                button.innerHTML = '▶ Hide';
+            }
+        }
+        </script>
+        """
+        
+        # Create HTML for the sidebar - use safe access to session state
+        sidebar_visible = st.session_state.get('sidebar_visible', True)
+        sidebar_class = "" if sidebar_visible else "hidden"
+        button_class = "" if sidebar_visible else "hidden"
+        button_text = "▶ Hide" if sidebar_visible else f"◀ Show {category_display} Table"
+        
+        sidebar_html = f"""
+        <div class="cluster-sidebar {sidebar_class}" id="clusterSidebar">
+            <h3>{category_display} Summary</h3>
+            <div id="sidebar-content">
+                <!-- The table content will be inserted here by Streamlit -->
+            </div>
+        </div>
+        <button onclick="toggleSidebar()" class="sidebar-toggle {button_class}">{button_text}</button>
+        {toggle_js}
+        """
+        
+        # Add the sidebar HTML
+        st.components.v1.html(sidebar_html, height=0)
+        
+        # Create a container for the sidebar content
+        sidebar_container = st.container()
+        
+        if 'selected_cluster' not in st.session_state:
+            st.session_state.selected_cluster = None
+
+        # Listen for cluster selection from the map
+        selected_cluster = st.session_state.get('selected_cluster', None)
+        if selected_cluster is not None:
+            st.session_state.selected_cluster = selected_cluster
+            st.rerun()
+            
+        if selected_cluster is not None and selected_cluster in plot_df['cluster'].values:
+            # Filter for just the selected cluster
+            plot_df = plot_df[plot_df['cluster'] == selected_cluster].copy()
+            # Update the title
+            title = f"{title} - {get_category_display_name(category)} {selected_cluster}"
+        
+        if 'selected_cluster' in st.session_state and st.session_state.selected_cluster is not None:
+            # A cluster is selected, show export options based on date availability
+            export_cols = st.columns(2)
+            
+            with export_cols[0]:
+                # Get data for this specific cluster
+                cluster_data = st.session_state.results[st.session_state.results['cluster'] == st.session_state.selected_cluster]
+                
+                # Get unique dates this cluster appears on 
+                if not cluster_data.empty:
+                    unique_dates = sorted(cluster_data['acq_date'].unique())
+                    
+                    # Show export button if multiple dates exist
+                    if len(unique_dates) > 1:
+                        if st.button("Export Timeline", key="export_timeline_btn", use_container_width=True):
+                            export_timeline(
+                                st.session_state.results,
+                                st.session_state.selected_cluster,
+                                category,
+                                unique_dates,  # Pass the actual dates for this cluster
+                                basemap_tiles,
+                                map_settings.get('basemap', 'Dark')
+                            )
+                    else:
+                        # If only one date, show info message
+                        st.info(f"This {get_category_singular(category)} only appears on one date. Timeline export requires multiple dates.")
+                else:
+                    # Shouldn't happen, but handle empty cluster data
+                    st.warning(f"No data available for {get_category_singular(category)} {st.session_state.selected_cluster}.")
+            
+            with export_cols[1]:
+                if st.button("Exit Play Back", key="exit_playback_btn", use_container_width=True):
+                    st.session_state.playback_mode = False
+                    st.rerun()
         else:
-            # No results yet
-            st.info("Select settings and click 'Generate Analysis' to visualize fire data.")
+            # No cluster selected - this message should only appear if truly no selection
+            st.info(f"Select date range, location and category to generate map.")
+        
+        # Sidebar content in a hidden div that will be moved to the sidebar by JS
+        with st.container():
+            # Hide this container visually but keep it in the DOM
+            st.markdown('<div id="hidden-sidebar-content" style="display:none">', unsafe_allow_html=True)
+            
+            if cluster_summary is not None:
+                # Allow user to select a cluster from the table
+                st.write(f"Select a {get_category_singular(category)} to highlight on the map:")
+                cluster_options = [f"{get_category_display_name(category)} {c}" for c in cluster_summary['cluster'].tolist()]
+                
+                # Store options in session state for syncing with map selection
+                st.session_state['cluster_options'] = cluster_options
+                
+                selected_from_table = st.selectbox(
+                    f"Select {get_category_singular(category)}",
+                    ["None"] + cluster_options,
+                    key="cluster_select"
+                )
+                
+                if selected_from_table != "None":
+                    cluster_id = int(selected_from_table.split(' ')[-1])
+                    
+                    # Check if this is a new selection (different from current)
+                    if st.session_state.get('selected_cluster') != cluster_id:
+                        # Store the previous value to compare
+                        prev_selected = st.session_state.get('selected_cluster')
+                        st.session_state.selected_cluster = cluster_id
+                        
+                        # Get unique dates for the selected cluster
+                        cluster_points = st.session_state.results[st.session_state.results['cluster'] == st.session_state.selected_cluster]
+                        unique_dates = sorted(cluster_points['acq_date'].unique())
+                        
+                        # Store the dates and initialize to the first one
+                        st.session_state.playback_dates = unique_dates
+                        st.session_state.playback_index = 0
+                        
+                        # Reset playback mode when selecting a new cluster
+                        st.session_state.playback_mode = False
+                        
+                        # Only rerun if this was a genuinely new selection
+                        # This prevents the infinite refresh loop
+                        if prev_selected != cluster_id:
+                            st.rerun()
+                else:
+                    # If "None" is selected, clear the selected cluster
+                    if st.session_state.get('selected_cluster') is not None:
+                        prev_selected = st.session_state.get('selected_cluster')
+                        st.session_state.selected_cluster = None
+                        
+                        # Only rerun if this was a genuinely new selection
+                        if prev_selected is not None:
+                            st.rerun()
+                
+                # Display the cluster table
+                # Highlight the selected cluster in the table if o
+                # ne is selected
+                if st.session_state.get('selected_cluster') is not None:
+                    highlight_func = lambda x: ['background-color: rgba(255, 220, 40, 0.6); color: black;' 
+                                              if x.name == st.session_state.get('selected_cluster') 
+                                              else '' for i in x]
+                    styled_summary = cluster_summary.style.apply(highlight_func, axis=1)
+                    st.dataframe(
+                        styled_summary,
+                        column_config={
+                            "cluster": f"{get_category_display_name(category)} ID",
+                            "Number of Points": st.column_config.NumberColumn(help=f"{category_display} detections in cluster"),
+                            "Mean FRP": st.column_config.NumberColumn(format="%.2f"),
+                            "Total FRP": st.column_config.NumberColumn(format="%.2f"),
+                        },
+                        hide_index=True,
+                        use_container_width=True
+                    )
+                else:
+                    # Display the normal table without highlighting
+                    st.dataframe(
+                        cluster_summary,
+                        column_config={
+                            "cluster": f"{get_category_display_name(category)} ID",
+                            "Number of Points": st.column_config.NumberColumn(help=f"{category_display} detections in cluster"),
+                            "Mean FRP": st.column_config.NumberColumn(format="%.2f"),
+                            "Total FRP": st.column_config.NumberColumn(format="%.2f"),
+                        },
+                        hide_index=True,
+                        use_container_width=True
+                    )
+                
+                # Display detailed info for the selected cluster
+                if st.session_state.get('selected_cluster') is not None:
+                    cluster_data = cluster_summary[cluster_summary['cluster'] == st.session_state.get('selected_cluster')].iloc[0]
+                    
+                    st.markdown("---")
+                    st.write(f"### {get_category_display_name(category)} {st.session_state.get('selected_cluster')} Details")
+                    
+                    # Create two columns for details
+                    detail_col1, detail_col2 = st.columns(2)
+                    
+                    with detail_col1:
+                        st.write(f"**Detection Points:** {cluster_data['Number of Points']}")
+                        st.write(f"**Mean Location:** {cluster_data['Mean Latitude']}, {cluster_data['Mean Longitude']}")
+                        st.write(f"**First Detection:** {cluster_data['First Detection']}")
+                        st.write(f"**Last Detection:** {cluster_data['Last Detection']}")
+                    
+                    with detail_col2:
+                        st.write(f"**Mean FRP:** {cluster_data['Mean FRP']:.2f}")
+                        st.write(f"**Total FRP:** {cluster_data['Total FRP']:.2f}")
+                        if 'Mean Temperature' in cluster_data:
+                            st.write(f"**Mean Temperature:** {cluster_data['Mean Temperature']:.2f}K")
+                            st.write(f"**Max Temperature:** {cluster_data['Max Temperature']:.2f}K")
+                        
+                        # Add OSM information if available for flares and volcanoes
+                        if category in ['flares', 'volcanoes'] and 'OSM Matches' in cluster_data:
+                            st.write(f"**OSM Feature Matches:** {int(cluster_data['OSM Matches'])}")
+                            if 'Mean OSM Distance (km)' in cluster_data and not pd.isna(cluster_data['Mean OSM Distance (km)']):
+                                st.write(f"**Mean OSM Distance:** {cluster_data['Mean OSM Distance (km)']:.2f} km")
+                    
+                    # Add a help tooltip
+                    st.info("""
+                    **FRP** (Fire Radiative Power) is measured in megawatts (MW) and indicates the intensity of the fire.
+                    Higher values suggest more intense burning.
+                    """)
+                    
+                    if 'Mean Temperature' in cluster_data:
+                        st.info("""
+                        **Temperature coloring**: 
+                        - Yellow/White indicates the hottest areas (higher temperature)
+                        - Orange/Red shows medium temperature
+                        - Purple/Black indicates lower temperature
+                        """)
+                        
+                    # Add OSM explanation if applicable
+                    if category in ['flares', 'volcanoes'] and 'OSM Matches' in cluster_data:
+                        if category == 'flares':
+                            st.info("""
+                            **OSM Matches** show points within 10km of:
+                            - Industrial flare stacks
+                            - Oil and gas facilities
+                            - Flare headers
+                            - Other industrial areas tagged in OpenStreetMap
+                            """)
+                        elif category == 'volcanoes':
+                            st.info("""
+                            **OSM Matches** show points within 10km of:
+                            - Known volcanoes
+                            - Volcanic vents
+                            - Different volcano types (stratovolcano, shield, caldera, etc.)
+                            - Other geological features tagged in OpenStreetMap
+                            """)
+            
+            # Close the hidden content div
+            st.markdown('</div>', unsafe_allow_html=True)
+            
+        # JavaScript to move sidebar content into the sidebar container
+        sidebar_js = """
+        <script>
+        // Function to move content to sidebar
+        function moveSidebarContent() {
+            const content = document.getElementById('hidden-sidebar-content');
+            const sidebar = document.getElementById('sidebar-content');
+            if (content && sidebar) {
+                sidebar.innerHTML = content.innerHTML;
+                content.style.display = 'none';
+            }
+        }
+        
+        // Execute after page is loaded
+        if (document.readyState === 'complete') {
+            moveSidebarContent();
+        } else {
+            window.addEventListener('load', moveSidebarContent);
+        }
+        </script>
+        """
+        
+        # Add the script to move content
+        st.components.v1.html(sidebar_js, height=0)
 
 if __name__ == "__main__":
     main()

@@ -428,17 +428,8 @@ class FIRMSHandler:
         }
         return bboxes.get(country, None)
 
-    def _apply_dbscan(self, df, eps=0.01, min_samples=5, bbox=None, max_time_diff_days=5):
-        """Apply DBSCAN clustering with bbox filtering and time-based constraints
-        
-        Args:
-            df (pandas.DataFrame): DataFrame with latitude and longitude columns
-            eps (float): DBSCAN eps parameter - spatial proximity threshold
-            min_samples (int): Minimum points to form a cluster
-            bbox (str): Bounding box string "min_lon,min_lat,max_lon,max_lat"
-            max_time_diff_days (int): Maximum days between events to consider as same cluster
-                                    Higher values will group events over longer time periods
-        """
+    def _apply_dbscan(self, df, eps=0.01, min_samples=5, bbox=None, max_time_diff_days=1):
+        """Apply DBSCAN clustering with bbox filtering and time-based constraints"""
         if len(df) < min_samples:
             st.warning(f"Too few points ({len(df)}) for clustering. Minimum required: {min_samples}")
             return df
@@ -538,8 +529,7 @@ class FIRMSHandler:
         use_clustering=True,
         eps=0.01,
         min_samples=5,
-        chunk_days=7,  # Default chunk size
-        max_time_diff_days=5  # Maximum days gap to consider as same fire (default: 5 days)
+        chunk_days=7  # Default chunk size
     ):
         """Fetch and process fire data from FIRMS API with support for historical data"""
         
@@ -860,16 +850,15 @@ class FIRMSHandler:
                     return None
                 
                 all_results = filtered_df
-
-            # Apply clustering to the results if needed
-            if use_clustering and not all_results.empty:
-                all_results = self._apply_dbscan(all_results, eps=eps, min_samples=min_samples, bbox=bbox, max_time_diff_days=max_time_diff_days)
-
-            # Apply spatial joins for specific categories
-            if category in ['flares', 'volcanoes'] and HAVE_GEO_DEPS and not all_results.empty:
-                with st.spinner(f'Performing spatial join with OSM {category} data...'):
-                    all_results = self.osm_handler.spatial_join(all_results, category, bbox)
-                    st.info(f"Spatial join completed. Found {len(all_results)} matching points.")
+        
+        # Apply clustering to the results if needed
+        if use_clustering and not all_results.empty:
+            all_results = self._apply_dbscan(all_results, eps=eps, min_samples=min_samples, bbox=bbox, max_time_diff_days=1)
+        
+        # Apply spatial joins for specific categories
+        if category in ['flares', 'volcanoes'] and HAVE_GEO_DEPS and not all_results.empty:
+            with st.spinner(f'Performing spatial join with OSM {category} data...'):
+                original_count = len(all_results)
                 all_results = self.osm_handler.spatial_join(all_results, category, bbox)
                 
                 # If spatial join found no matches
@@ -1727,8 +1716,6 @@ def display_feature_exploration(df, cluster_id, category, current_date=None, cal
                 st.warning("Not enough time-series data to generate chart.")
     else:
         st.info("Please select at least one feature to visualize.")
-        
-
 
 def display_coordinate_view(df, playback_date=None):
     """Display a table with coordinates and details for the selected cluster"""
@@ -1956,8 +1943,6 @@ def main():
                 min_value=start_date,
                 max_value=today
             )
-            
-        
         
         # Calculate date range in days
         date_range_days = (end_date - start_date).days
@@ -1969,25 +1954,6 @@ def main():
         if country in large_countries and date_range_days > 14:
             st.warning(f"⚠️ You selected a {date_range_days}-day period for {country}, which is a large country. This may take a long time to process. Consider reducing your date range to 14 days or less for faster results.")
         
-        with st.expander("Advanced Clustering Settings"):
-            # Two-column layout for clustering parameters
-            clust_cols = st.columns(2)
-            
-            with clust_cols[0]:
-                eps_val = st.slider("Spatial Proximity (eps)", 0.005, 0.05, value=0.01, step=0.001, 
-                                    help="DBSCAN eps parameter. Higher values create larger clusters.")
-            
-            with clust_cols[1]:
-                min_samples_val = st.slider("Minimum Points", 3, 15, value=5, step=1,
-                                        help="Minimum points required to form a cluster.")
-                
-            use_clustering = st.checkbox("Use Clustering", value=True, 
-                                    help="Group nearby detections into clusters for easier analysis.")
-                                    
-            # Add time-based clustering parameter
-            max_time_diff = st.slider("Max Days Between Events (Same Cluster)", 1, 10, value=5, step=1,
-                                    help="Maximum days between fire events to be considered same cluster. Lower values create more temporally distinct clusters.")
-                
         # API credentials (hidden in expander)
         with st.expander("API Settings"):
             username = st.text_input("FIRMS Username", value="tombrown4444")
